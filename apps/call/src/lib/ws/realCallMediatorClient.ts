@@ -1,0 +1,933 @@
+import { closeCall, searchDocuments } from "../api/coreClient";
+import type {
+  CallGuardFlag,
+  CallGuardIntervention,
+  CallWrapUp,
+  ClosureEvent,
+  ClosureVerdict,
+  ComplianceFinding,
+  ComplianceUnavailable,
+  DemoDomain,
+  DocumentSource,
+  ManualSearchRequest,
+  MaskedSpan,
+  MaskType,
+  RecommendationBatch,
+  RecommendationCard,
+  RoutingDecision,
+  Speaker,
+  TranscriptEvent,
+} from "../../types/contract";
+import type { CallMediatorClient, CallMediatorListener, WrapUpSegment } from "./types";
+
+type ParsedMessage =
+  | { kind: "started"; payload: { call_id: string } }
+  | { kind: "transcript"; payload: TranscriptEvent }
+  | { kind: "recommendation"; payload: RecommendationBatch }
+  | { kind: "recommendation_pending"; payload: { call_id: string } }
+  | { kind: "call_guard"; payload: { segment_id: string; flags: CallGuardFlag[] } }
+  | { kind: "compliance"; payload: { segment_id: string; findings: ComplianceFinding[] } }
+  | { kind: "compliance_unavailable"; payload: { segment_id: string; event: ComplianceUnavailable } }
+  | { kind: "closure"; payload: ClosureEvent }
+  | { kind: "routing_decision"; payload: RoutingDecision }
+  | { kind: "call_guard_intervention"; payload: CallGuardIntervention }
+  /** 알아본 종류인데 형식이 어긋났다 — 오류 배너 없이 버린다(C-6 베타, 티켓 `w8-c6-intervention-overlay-ui`). */
+  | { kind: "ignored" };
+
+/** 재연결 대기 — 1초에서 두 배씩, 최대 30초. 콜 미디에이터의 25초 핑 끊김·네트워크 순단을 넘긴다. */
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
+
+export class RealCallMediatorClient implements CallMediatorClient {
+  readonly mode = "live" as const;
+  private socket: WebSocket | null = null;
+  private listeners: CallMediatorListener | null = null;
+  /** 사용자가 끊은 것인가 — 그때만 다시 붙지 않는다(`disconnect()`). */
+  private closedByUser = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
+  /**
+   * 이 화면이 보는 통화. `?call_id=` 로 열었으면 그 값, 아니면 **처음 받은 메시지의 통화**에 묶인다(2026-10-01).
+   * 콜 미디에이터의 `/ws` 는 `call_id` 없이 열면 **모든 통화**를 보낸다 — 10-01 QA 3회차에서 재생 통화 6건과 화자 분리
+   * 시험 통화가 한 화면에 섞여, 다른 통화의 콜가드 핀이 같은 발화 번호의 줄에 붙었다. 다른 통화의 메시지는 버린다.
+   */
+  private boundCallId: string | null = null;
+
+  constructor(private readonly url: string) {}
+
+  /**
+   * 2026-10-01 — 끊기면 스스로 다시 붙는다(`decisions/138` 예외). 전에는 재시도 코드가 없어 콜 미디에이터가
+   * 25초 핑에 응답 없는 대시보드를 끊으면(`ws_server.ts`) 새로고침 전까지 자막이 영구히 멈췄다(적용 감사 02).
+   * 구독 소켓은 상태가 없어 다시 붙기만 하면 그 뒤 메시지는 그대로 온다 — 끊긴 사이의 메시지는 잃는다(사실대로 둔다).
+   */
+  connect(listeners: CallMediatorListener): void {
+    this.disconnect();
+    this.closedByUser = false;
+    this.reconnectAttempts = 0;
+    this.listeners = listeners;
+    this.boundCallId = callIdOfSubscription(this.url);
+    this.open();
+  }
+
+  private open(): void {
+    const listeners = this.listeners;
+    if (listeners === null || this.closedByUser) {
+      return;
+    }
+    listeners.onStatus({ mode: "live", connected: false });
+
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(this.url);
+    } catch {
+      listeners.onError("콜 미디에이터에 연결하지 못했습니다.");
+      this.scheduleReconnect();
+      return;
+    }
+    this.socket = socket;
+
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) {
+        return;
+      }
+      this.reconnectAttempts = 0;
+      this.listeners?.onStatus({ mode: "live", connected: true });
+    });
+
+    socket.addEventListener("message", (event: MessageEvent<string>) => {
+      if (this.socket === socket) {
+        this.handleMessage(event.data);
+      }
+    });
+
+    socket.addEventListener("error", () => {
+      if (this.socket === socket) {
+        this.listeners?.onError("콜 미디에이터 연결에 문제가 생겼습니다.");
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      if (this.socket !== socket) {
+        return;
+      }
+      this.socket = null;
+      this.listeners?.onStatus({ mode: "live", connected: false });
+      this.scheduleReconnect();
+    });
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closedByUser || this.listeners === null || this.reconnectTimer !== null) {
+      return;
+    }
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempts, RECONNECT_MAX_MS);
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.open();
+    }, delay);
+  }
+
+  disconnect(): void {
+    this.closedByUser = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.socket !== null) {
+      const socket = this.socket;
+      this.socket = null;
+      socket.close();
+    }
+    this.listeners = null;
+  }
+
+  /**
+   * B-6 수동 검색 — `POST /hub/search`(REST). 웹소켓 계약이 아니라 별도 REST
+   * 호출이라 콜 미디에이터 연결 여부와 무관하게 바로 부른다(`w4-dashboard-live-contract`).
+   * `call_id`는 검색 자체에는 쓰이지 않는다(서버 계약에 없음) — 결과를 그
+   * 통화에 붙이는 것은 호출부(스토어) 몫이다.
+   */
+  async manualSearch(request: ManualSearchRequest): Promise<RecommendationBatch> {
+    const cards = await searchDocuments(request.query);
+    return {
+      fired: true,
+      call_id: request.call_id,
+      trigger_at_ms: 0,
+      cards,
+      internal_latency_ms: 0,
+    };
+  }
+
+  /**
+   * `decisions/306` — `POST /hub/calls/{id}/close`. D-2 분류는 규칙 기반이라 유형이
+   * 늘 `null`로 온다 — 카테고리를 지어내지 않고 빈 채로 둔다(`callSummaryFromWrapUp`가
+   * 빈 문자열이면 칩을 안 그린다). 감정분석·지역자원도 서버에 없어 비운다.
+   */
+  async wrapUp(callId: string, segments: WrapUpSegment[]): Promise<CallWrapUp> {
+    if (segments.length === 0) {
+      throw new Error("발화가 없어 통화 후 처리를 만들 수 없습니다.");
+    }
+    const draft = await closeCall(
+      callId,
+      segments.map((s) => ({
+        segmentId: s.segment_id,
+        speaker: s.speaker,
+        text: s.text,
+        isFinal: s.is_final,
+        utteranceEndMs: s.utterance_end_ms,
+      })),
+    );
+    return {
+      call_id: draft.callId,
+      summary: [draft.summaryText],
+      category: draft.inquiryType ?? "",
+      follow_ups: draft.followUpActions,
+    };
+  }
+
+  private handleMessage(raw: string): void {
+    const listeners = this.listeners;
+    if (listeners === null) {
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      listeners.onError("콜 미디에이터 메시지를 읽지 못했습니다.");
+      return;
+    }
+
+    const message = parseCallMediatorMessage(parsed);
+    if (message === null) {
+      listeners.onError("알 수 없는 콜 미디에이터 메시지입니다.");
+      return;
+    }
+    if (message.kind === "ignored") {
+      return;
+    }
+
+    const frameCallId = callIdOfFrame(parsed);
+    const decision = bindOrFilter(this.boundCallId, frameCallId);
+    if (decision === "drop") {
+      return; // 다른 통화의 메시지 — 이 화면 것이 아니다
+    }
+    if (decision === "bind") {
+      this.boundCallId = frameCallId;
+    }
+
+    if (message.kind === "started") {
+      listeners.onStarted?.(message.payload.call_id);
+      return;
+    }
+    if (message.kind === "transcript") {
+      listeners.onTranscript(message.payload);
+      return;
+    }
+    if (message.kind === "recommendation") {
+      listeners.onRecommendation(message.payload);
+      return;
+    }
+    if (message.kind === "recommendation_pending") {
+      listeners.onRecommendationPending?.(message.payload.call_id);
+      return;
+    }
+    if (message.kind === "call_guard") {
+      for (const flag of message.payload.flags) {
+        listeners.onCallGuard?.(message.payload.segment_id, flag);
+      }
+      return;
+    }
+    if (message.kind === "compliance") {
+      for (const finding of message.payload.findings) {
+        listeners.onCompliance?.(message.payload.segment_id, finding);
+      }
+      return;
+    }
+    if (message.kind === "compliance_unavailable") {
+      listeners.onComplianceUnavailable?.(message.payload.segment_id, message.payload.event);
+      return;
+    }
+    if (message.kind === "routing_decision") {
+      listeners.onRoutingDecision?.(message.payload);
+      return;
+    }
+    if (message.kind === "call_guard_intervention") {
+      listeners.onCallGuardIntervention?.(message.payload);
+      return;
+    }
+    listeners.onClosure(message.payload);
+  }
+}
+
+export function parseCallMediatorMessage(value: unknown): ParsedMessage | null {
+  const body = unwrapPayload(value);
+  if (body === null) {
+    return null;
+  }
+
+  const tagged = readString(body, "type");
+  // C-6 베타 — 보조 표시라 형식이 어긋나도 오류 배너를 띄우지 않는다(다른 종류와 다르게 다룬다).
+  if (tagged === "call_guard_intervention") {
+    const payload = parseCallGuardIntervention(isRecord(body.payload) ? body.payload : body);
+    return payload === null ? { kind: "ignored" } : { kind: tagged, payload };
+  }
+  if (
+    tagged === "started" ||
+    tagged === "transcript" ||
+    tagged === "recommendation" ||
+    tagged === "recommendation_pending" ||
+    tagged === "call_guard" ||
+    tagged === "compliance" ||
+    tagged === "compliance_unavailable" ||
+    tagged === "closure" ||
+    tagged === "routing_decision"
+  ) {
+    const inner = isRecord(body.payload) ? body.payload : body;
+    return parseByKind(tagged, inner);
+  }
+
+  if (hasKeys(body, ["segment_id", "speaker", "text"])) {
+    return parseByKind("transcript", body);
+  }
+  // fired:false 응답에는 cards·trigger_at_ms 가 없다 (server/apps/hub 참고) — fired 단독으로도 잡는다.
+  if (hasKeys(body, ["cards", "trigger_at_ms"]) || hasKeys(body, ["fired"])) {
+    return parseByKind("recommendation", body);
+  }
+  if (hasKeys(body, ["verdict", "evidence", "missing"])) {
+    return parseByKind("closure", body);
+  }
+  return null;
+}
+
+function parseByKind(
+  kind:
+    | "started"
+    | "transcript"
+    | "recommendation"
+    | "recommendation_pending"
+    | "call_guard"
+    | "compliance"
+    | "compliance_unavailable"
+    | "closure"
+    | "routing_decision",
+  body: Record<string, unknown>,
+): ParsedMessage | null {
+  if (kind === "started") {
+    const payload = parseStarted(body);
+    return payload === null ? null : { kind, payload };
+  }
+  if (kind === "transcript") {
+    const payload = parseTranscript(body);
+    return payload === null ? null : { kind, payload };
+  }
+  if (kind === "recommendation") {
+    const payload = parseRecommendation(body);
+    return payload === null ? null : { kind, payload };
+  }
+  if (kind === "recommendation_pending") {
+    const payload = parseRecommendationPending(body);
+    return payload === null ? null : { kind, payload };
+  }
+  if (kind === "call_guard") {
+    const payload = parseCallGuard(body);
+    return payload === null ? null : { kind, payload };
+  }
+  if (kind === "compliance") {
+    const payload = parseCompliance(body);
+    return payload === null ? null : { kind, payload };
+  }
+  if (kind === "compliance_unavailable") {
+    const payload = parseComplianceUnavailable(body);
+    return payload === null ? null : { kind, payload };
+  }
+  if (kind === "routing_decision") {
+    const payload = parseRoutingDecision(body);
+    return payload === null ? null : { kind, payload };
+  }
+  const payload = parseClosure(body);
+  return payload === null ? null : { kind, payload };
+}
+
+/** `services/call-mediator`의 `StartedPayload` — 통화가 서버에 만들어졌다는 신호. */
+function parseStarted(body: Record<string, unknown>): { call_id: string } | null {
+  const call_id = readString(body, "call_id");
+  return call_id === null ? null : { call_id };
+}
+
+/** `services/call-mediator`의 `RecommendationPending` — 「검색 중」 신호. 값은 문자열(7.3절). */
+function parseRecommendationPending(body: Record<string, unknown>): { call_id: string } | null {
+  const call_id = readString(body, "call_id");
+  return call_id === null ? null : { call_id };
+}
+
+/** `CallGuardCheckResponse` 그대로 — 한 세그먼트에 잡힌 갈래 여러 건. */
+function parseCallGuard(
+  body: Record<string, unknown>,
+): { segment_id: string; flags: CallGuardFlag[] } | null {
+  const segment_id = readString(body, "segment_id");
+  if (segment_id === null || !Array.isArray(body.flags)) {
+    return null;
+  }
+  const segmentIdNum = Number(segment_id);
+  const flags: CallGuardFlag[] = [];
+  for (const item of body.flags) {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const category = readCallGuardCategory(item.category);
+    if (category === null) {
+      return null;
+    }
+    const flag: CallGuardFlag = { segment_id: segmentIdNum, category };
+    // 걸린 표현(마스킹된 자막 기준). 비었거나 없으면 싣지 않는다 — 배너는 갈래 안내만 그린다.
+    const phrase = readString(item, "phrase");
+    if (phrase !== null && phrase.trim().length > 0) {
+      flag.phrase = phrase;
+    }
+    flags.push(flag);
+  }
+  return { segment_id, flags };
+}
+
+/**
+ * C-6 베타 — 미디에이터 `CallGuardInterventionPayload`(값은 전부 문자열). 모르는 `stage`·빠진 필드면 null.
+ * `beta: "true"` 가 없으면 받지 않는다 — 베타 표시가 없는 메시지를 베타 꼬리표 없이 그리지 않으려고.
+ * 일시정지 단계(`warning`·`final_warning`)는 안내 문구와 0보다 큰 `pause_ms` 가 있어야 한다.
+ */
+export function parseCallGuardIntervention(body: Record<string, unknown>): CallGuardIntervention | null {
+  const call_id = readString(body, "call_id");
+  const segment_id = readNumber(body, "segment_id");
+  const stage = readString(body, "stage");
+  const abuse_count = readNumber(body, "abuse_count");
+  const pause_ms = readNumber(body, "pause_ms");
+  const announcement = readString(body, "announcement");
+  const source_doc_id = readString(body, "source_doc_id");
+  if (
+    call_id === null ||
+    segment_id === null ||
+    abuse_count === null ||
+    pause_ms === null ||
+    pause_ms < 0 ||
+    source_doc_id === null ||
+    readString(body, "beta") !== "true"
+  ) {
+    return null;
+  }
+  if (stage === "warning" || stage === "final_warning") {
+    if (announcement === null || announcement.trim().length === 0 || pause_ms <= 0) {
+      return null;
+    }
+    return { call_id, segment_id, stage, abuse_count, pause_ms, announcement, source_doc_id };
+  }
+  if (stage === "end_suggested") {
+    return { call_id, segment_id, stage, abuse_count, pause_ms: 0, announcement: null, source_doc_id };
+  }
+  return null;
+}
+
+function readCallGuardCategory(value: unknown): CallGuardFlag["category"] | null {
+  const str = readStringValue(value);
+  if (str === "insult" || str === "threat" || str === "sexual" || str === "distress") {
+    return str;
+  }
+  return null;
+}
+
+/**
+ * `ComplianceCheckResponse` 그대로(`compliance_schema.py` `ComplianceFindingSchema`) —
+ * 한 세그먼트에 잡힌 위반 여러 건. `alternative_source`는 선택 필드라 `parseClosure`의
+ * `source`와 같은 방식으로 있을 때만 검증한다.
+ */
+function parseCompliance(
+  body: Record<string, unknown>,
+): { segment_id: string; findings: ComplianceFinding[] } | null {
+  const segment_id = readString(body, "segment_id");
+  if (segment_id === null || !Array.isArray(body.findings)) {
+    return null;
+  }
+  const segmentIdNum = Number(segment_id);
+  const findings: ComplianceFinding[] = [];
+  for (const item of body.findings) {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const rule_code = readString(item, "rule_code");
+    const phrase = readString(item, "phrase");
+    if (rule_code === null || phrase === null) {
+      return null;
+    }
+    const finding: ComplianceFinding = { segment_id: segmentIdNum, rule_code, phrase };
+    if (item.alternative_source !== undefined && item.alternative_source !== null) {
+      const source = parseSource(item.alternative_source);
+      if (source === null) {
+        return null;
+      }
+      finding.alternative_source = source;
+    }
+    findings.push(finding);
+  }
+  return { segment_id, findings };
+}
+
+/**
+ * `ComplianceUnavailable` 그대로(`services/call-mediator/src/app/ports.ts`) — 검사가
+ * 실패했다는 신호다. `status`는 고정 값 집합이 아니라 자유 문자열이라(`statusOf()`)
+ * enum 검증 없이 `readString`으로만 받는다.
+ */
+function parseComplianceUnavailable(
+  body: Record<string, unknown>,
+): { segment_id: string; event: ComplianceUnavailable } | null {
+  const call_id = readString(body, "call_id");
+  const segment_id = readString(body, "segment_id");
+  const status = readString(body, "status");
+  if (call_id === null || segment_id === null || status === null) {
+    return null;
+  }
+  return { segment_id, event: { call_id, segment_id: Number(segment_id), status } };
+}
+
+/**
+ * `RoutingDecisionPayload` 그대로(`services/call-mediator/src/app/ports.ts`) —
+ * J-5 배정 판정. `assigned_agent_id`는 선택 필드처럼 null이 올 수 있어
+ * `readStringValue`로만 받는다(없으면 "타입 틀림" 경고가 아니라 그냥 null).
+ */
+function parseRoutingDecision(body: Record<string, unknown>): RoutingDecision | null {
+  const call_id = readString(body, "call_id");
+  const is_blacklisted = readBoolean(body, "is_blacklisted");
+  const fell_back = readBoolean(body, "fell_back");
+  const reason = readString(body, "reason");
+  const customer_identified = readBoolean(body, "customer_identified");
+  const veteran_years = readNumber(body, "veteran_years");
+  const unknown_candidates = parseStringList(body.unknown_candidates);
+  if (
+    call_id === null ||
+    is_blacklisted === null ||
+    fell_back === null ||
+    reason === null ||
+    customer_identified === null ||
+    veteran_years === null ||
+    unknown_candidates === null
+  ) {
+    return null;
+  }
+  return {
+    call_id,
+    assigned_agent_id: readStringValue(body.assigned_agent_id),
+    is_blacklisted,
+    fell_back,
+    reason,
+    customer_identified,
+    veteran_years,
+    unknown_candidates,
+  };
+}
+
+function unwrapPayload(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return value;
+}
+
+function parseTranscript(body: Record<string, unknown>): TranscriptEvent | null {
+  const call_id = readString(body, "call_id");
+  const segment_id = readString(body, "segment_id");
+  const speaker = readSpeaker(body.speaker);
+  const text = readString(body, "text");
+  const is_final = readBoolean(body, "is_final");
+  const utterance_end_ms = readNumber(body, "utterance_end_ms");
+  const masked = parseMaskedList(body.masked);
+  if (
+    call_id === null ||
+    segment_id === null ||
+    speaker === null ||
+    text === null ||
+    is_final === null ||
+    utterance_end_ms === null ||
+    masked === null
+  ) {
+    return null;
+  }
+  const event: TranscriptEvent = {
+    call_id,
+    segment_id,
+    speaker,
+    text,
+    masked,
+    is_final,
+    utterance_end_ms,
+  };
+  const domain = readDomain(body.domain);
+  if (domain !== undefined) {
+    event.domain = domain;
+  }
+  return event;
+}
+
+function parseRecommendation(body: Record<string, unknown>): RecommendationBatch | null {
+  const fired = readBoolean(body, "fired");
+  if (fired === null) {
+    return null;
+  }
+
+  if (!fired) {
+    // 트리거 미발동 — 검색조차 하지 않았다. 서버는 call_id·cards 등을 보내지 않는다.
+    const batch: RecommendationBatch = {
+      fired: false,
+      call_id: readString(body, "call_id") ?? "",
+      trigger_at_ms: readNumber(body, "trigger_at_ms") ?? 0,
+      cards: [],
+      internal_latency_ms: readNumber(body, "internal_latency_ms") ?? 0,
+    };
+    const domain = readDomain(body.domain);
+    if (domain !== undefined) {
+      batch.domain = domain;
+    }
+    return batch;
+  }
+
+  const call_id = readString(body, "call_id");
+  const trigger_at_ms = readNumber(body, "trigger_at_ms");
+  const internal_latency_ms = readNumber(body, "internal_latency_ms");
+  if (
+    call_id === null ||
+    trigger_at_ms === null ||
+    internal_latency_ms === null ||
+    !Array.isArray(body.cards)
+  ) {
+    return null;
+  }
+  const cards: RecommendationCard[] = [];
+  for (const item of body.cards) {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const card = parseCard(item);
+    if (card === null) {
+      return null;
+    }
+    cards.push(card);
+  }
+  const batch: RecommendationBatch = {
+    fired: true,
+    call_id,
+    trigger_at_ms,
+    cards,
+    internal_latency_ms,
+  };
+  const domain = readDomain(body.domain);
+  if (domain !== undefined) {
+    batch.domain = domain;
+  }
+  const segment_id = readString(body, "segment_id");
+  if (segment_id !== null && segment_id.length > 0) {
+    batch.segment_id = segment_id;
+  }
+  return batch;
+}
+
+function parseCard(body: Record<string, unknown>): RecommendationCard | null {
+  const title = readString(body, "title");
+  const summary = readString(body, "summary");
+  // NOTE: 서버가 아직 decisions/003(similarity_score) 대신 score로
+  // 응답하고 있어 임시 방어 처리. 장민석님이 서버 고치면 이 fallback은
+  // 제거 가능.
+  const similarity_score =
+    readNumber(body, "similarity_score") ?? readNumber(body, "score");
+  const source = parseSource(body.source);
+  if (title === null || summary === null || similarity_score === null || source === null) {
+    return null;
+  }
+  const card: RecommendationCard = { title, summary, source, similarity_score };
+  // 계약에 없는 필드라 없어도 통과시킨다 — 없으면 auto 로 본다.
+  const sourceType = readStringValue(body.source_type);
+  if (sourceType === "manual" || sourceType === "auto") {
+    card.source_type = sourceType;
+  }
+  // `decisions/308` — DB 미연결 카드는 null 로 온다. 카드 피드백을 보낼 수 없다는 뜻이다.
+  card.card_id = readStringValue(body.card_id);
+  return card;
+}
+
+/**
+ * `_project/decisions/305` — `closure_type`·`approved`/`blocked`를 걷어내고
+ * `procedure`·`verdict: complete/incomplete`·`detected`로 바꿨다. `reason`·`source`·
+ * `conditional`은 서버 DTO에서도 선택 필드다(`closure_verdict_dto.py`).
+ */
+function parseClosure(body: Record<string, unknown>): ClosureEvent | null {
+  const call_id = readString(body, "call_id");
+  const procedure = readString(body, "procedure");
+  const verdict = readVerdict(body.verdict);
+  const missing = parseStringList(body.missing);
+  const evidence = parseEvidence(body.evidence);
+  const detected = readBoolean(body, "detected");
+  if (
+    call_id === null ||
+    procedure === null ||
+    verdict === null ||
+    missing === null ||
+    evidence === null ||
+    detected === null
+  ) {
+    return null;
+  }
+  const event: ClosureEvent = {
+    call_id,
+    procedure,
+    evidence,
+    verdict,
+    missing,
+    detected,
+  };
+  const procedureTitle = readStringValue(body.procedure_title);
+  if (procedureTitle !== null) {
+    event.procedure_title = procedureTitle;
+  }
+  const reason = readStringValue(body.reason);
+  if (reason !== null) {
+    event.reason = reason;
+  }
+  if (body.source !== undefined && body.source !== null) {
+    const source = parseSource(body.source);
+    if (source === null) {
+      return null;
+    }
+    event.source = source;
+  }
+  if (body.conditional !== undefined && body.conditional !== null) {
+    const conditional = parseStringList(body.conditional);
+    if (conditional === null) {
+      return null;
+    }
+    event.conditional = conditional;
+  }
+  const domain = readDomain(body.domain);
+  if (domain !== undefined) {
+    event.domain = domain;
+  }
+  if (readStringValue(body.is_example) === "true") {
+    event.is_example = true;
+  }
+  return event;
+}
+
+function parseSource(value: unknown): DocumentSource | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const doc_id = readString(value, "doc_id");
+  const title = readString(value, "title");
+  if (doc_id === null || title === null) {
+    return null;
+  }
+  return { doc_id, title };
+}
+
+function parseMaskedList(value: unknown): MaskedSpan[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const spans: MaskedSpan[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const type = readMaskType(item.type);
+    const span = parseSpan(item.span);
+    if (type === null || span === null) {
+      return null;
+    }
+    spans.push({ type, span });
+  }
+  return spans;
+}
+
+function parseSpan(value: unknown): [number, number] | null {
+  if (!Array.isArray(value) || value.length !== 2) {
+    return null;
+  }
+  const start = readStringValue(value[0]);
+  const end = readStringValue(value[1]);
+  if (start === null || end === null) {
+    return null;
+  }
+  const startNum = Number(start);
+  const endNum = Number(end);
+  if (!Number.isFinite(startNum) || !Number.isFinite(endNum)) {
+    return null;
+  }
+  return [startNum, endNum];
+}
+
+function parseStringList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const items: string[] = [];
+  for (const item of value) {
+    const str = readStringValue(item);
+    if (str === null) {
+      return null;
+    }
+    items.push(str);
+  }
+  return items;
+}
+
+function parseEvidence(value: unknown): Record<string, boolean> | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const evidence: Record<string, boolean> = {};
+  for (const [key, flag] of Object.entries(value)) {
+    const raw = readStringValue(flag);
+    if (raw === "true") {
+      evidence[key] = true;
+    } else if (raw === "false") {
+      evidence[key] = false;
+    } else {
+      return null;
+    }
+  }
+  return evidence;
+}
+
+function readSpeaker(value: unknown): Speaker | null {
+  const str = readStringValue(value);
+  if (str === "customer" || str === "agent") {
+    return str;
+  }
+  return null;
+}
+
+function readVerdict(value: unknown): ClosureVerdict | null {
+  const str = readStringValue(value);
+  if (str === "complete" || str === "incomplete") {
+    return str;
+  }
+  return null;
+}
+
+function readMaskType(value: unknown): MaskType | null {
+  const str = readStringValue(value);
+  if (
+    str === "P1" ||
+    str === "P2" ||
+    str === "P3" ||
+    str === "P4" ||
+    str === "P5" ||
+    str === "P6" ||
+    str === "P7"
+  ) {
+    return str;
+  }
+  return null;
+}
+
+function readDomain(value: unknown): DemoDomain | undefined {
+  const str = readStringValue(value);
+  if (str === "dasan") {
+    return str;
+  }
+  return undefined;
+}
+
+/** 구독 주소의 `?call_id=` — 없으면 null(모든 통화를 받는 구독이라 첫 메시지에 묶는다). */
+export function callIdOfSubscription(url: string): string | null {
+  try {
+    const value = new URL(url).searchParams.get("call_id");
+    return value !== null && value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 프레임의 `payload.call_id`(문자열이면). 없으면 null — 통화를 가를 수 없는 메시지는 통과시킨다. */
+export function callIdOfFrame(frame: unknown): string | null {
+  if (typeof frame !== "object" || frame === null) {
+    return null;
+  }
+  const payload = (frame as { payload?: unknown }).payload;
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+  const id = (payload as { call_id?: unknown }).call_id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+/**
+ * 묶인 통화와 프레임의 통화를 견준다 — `bind`(처음 본 통화에 묶는다) · `drop`(다른 통화) · `keep`(같거나 가를 수 없음).
+ * 순수 함수라 테스트가 바로 본다.
+ */
+export function bindOrFilter(bound: string | null, frameCallId: string | null): "bind" | "drop" | "keep" {
+  if (frameCallId === null) {
+    return "keep";
+  }
+  if (bound === null) {
+    return "bind";
+  }
+  return bound === frameCallId ? "keep" : "drop";
+}
+
+/** 계약 위반을 한 번만 경고한다 — 메시지마다 찍으면 콘솔이 넘친다. 테스트가 되돌릴 수 있게 export. */
+export const contractWarnings = { warned: false };
+
+/**
+ * 2026-09-10 — 백엔드가 모든 응답 필드를 문자열로 보내기로 했다(장민석 확인,
+ * ngrok 실측). 그 밖의 타입이 오면 계약 위반이므로 조용히 넘기지 않는다. 실제 값(number·boolean)으로의
+ * 변환은 이 함수를 통과한 뒤 각 read*() 가 한다 — 나머지 앱 코드는 지금처럼 number·boolean 을 그대로 쓴다.
+ *
+ * 2026-10-01 — `alert()` 를 걷었다(`decisions/138` 예외, 적용 감사 03). 통화 중 블로킹 모달이 뜨면 자막이 멈추고
+ * 시연이 끊긴다. 계약 위반은 그 메시지를 버리고(전과 같다) 콘솔에 **한 번만** 경고한다 — 헤더 상태와
+ * 「탐지 미동작」 표시가 있어 조용한 초록이 되지 않는다.
+ */
+function readStringValue(value: unknown): string | null {
+  // undefined(필드 없음)·null(명시적 없음, 예: RecommendResponse.domain) 은
+  // "타입이 틀렸다"가 아니라 "값이 없다"이므로 경고 대상이 아니다.
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    if (!contractWarnings.warned) {
+      contractWarnings.warned = true;
+      console.warn("콜 미디에이터 계약 위반 — 문자열이 아닌 필드를 받아 그 메시지를 버렸습니다.", typeof value);
+    }
+    return null;
+  }
+  return value;
+}
+
+function readString(body: Record<string, unknown>, key: string): string | null {
+  return readStringValue(body[key]);
+}
+
+function readNumber(body: Record<string, unknown>, key: string): number | null {
+  const raw = readStringValue(body[key]);
+  if (raw === null) {
+    return null;
+  }
+  const num = Number(raw);
+  return Number.isFinite(num) ? num : null;
+}
+
+function readBoolean(body: Record<string, unknown>, key: string): boolean | null {
+  const raw = readStringValue(body[key]);
+  if (raw === "true") {
+    return true;
+  }
+  if (raw === "false") {
+    return false;
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasKeys(body: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.every((key) => key in body);
+}

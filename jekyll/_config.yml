@@ -1,0 +1,91 @@
+# Welcome to Jekyll!
+#
+# This config file is meant for settings that affect your whole blog, values
+# which you are expected to set up once and rarely edit after that. If you find
+# yourself editing this file very often, consider using Jekyll's data files
+# feature for the data you need to update frequently.
+#
+# For technical reasons, this file is *NOT* reloaded automatically when you use
+# 'bundle exec jekyll serve'. If you change this file, please restart the server process.
+#
+# If you need help with YAML syntax, here are some quick references for you:
+# https://learn-the-web.algonquindesign.ca/topics/markdown-yaml-cheat-sheet/#yaml
+# https://learnxinyminutes.com/docs/yaml/
+#
+# Site settings
+# These are used to personalize your new site. If you look in the HTML files,
+# you will see them accessed via {{ site.title }}, {{ site.email }}, and so on.
+# You can create any custom variable you would like, and they will be accessible
+# in the templates via {{ site.myvariable }}.
+
+title: CallGuard
+email: fbwns1234@gmail.com
+description: >- # this means to ignore newlines until "baseurl:"
+  StreamRAG : CallGuard — 통화 음성 스트림을 실시간으로 분석하고, 하이브리드 RAG와
+  가드레일로 지식과 컴플라이언스를 동시에 지원하는 AICC 어시스트.
+# ⚠ baseurl 은 비워 둔다 — 사이트 안의 링크가 전부 `/docs/09/` 같은 루트 절대경로다(405곳).
+# 커스텀 도메인(docs.solidbob.cloud)에서는 이게 맞고, `solidbob02.github.io/call.solidbob.cloud/`
+# 같은 프로젝트 페이지 주소에서는 전부 404 가 된다. 배포 워크플로가 `--baseurl` 로
+# 덮어쓰므로(`pages.yml`) 여기 값은 로컬 `jekyll serve` 기준이다. `_project/decisions/102`·`104`
+baseurl: ""
+url: "https://docs.solidbob.cloud"
+github_username:  solidbob02
+
+# Build settings
+theme: minima
+plugins:
+  - jekyll-feed
+
+# 상단 네비게이션에 표시할 페이지만 명시 (docs/ 하위 문서는 목차를 통해서만 접근)
+header_pages:
+  - toc.markdown
+  - progress.markdown
+
+# 백로그(칸반 티켓) — 항목 1건 = 파일 1개.
+# 한 파일을 여러 명이 동시에 고치면 병합 충돌이 나므로, 담당자가 자기 티켓 파일만
+# 만들고 고치도록 컬렉션으로 분리한다. 렌더링은 /kanban/ 이 담당한다.
+collections:
+  backlogs:
+    output: true
+    permalink: /backlog/:name/
+  # 개발 로그 — 항목 1건 = 파일 1개. 백로그와 같은 이유다.
+  # 하나의 progress.markdown 에 네 명이 전부 "맨 위"로 삽입하던 구조라 브랜치마다
+  # 같은 자리에서 충돌했다(2026-08-25~26 이 파일 커밋 37건 중 16건이 충돌 처리였다).
+  # 파일명에 작성자가 들어가므로 이제 서로의 파일이 겹치지 않는다.
+  # 개별 페이지는 만들지 않는다(output: false) — 렌더링은 /progress/ 가 담당한다.
+  logs:
+    output: false
+
+defaults:
+  - scope:
+      path: ""
+      type: backlogs
+    values:
+      layout: doc
+
+# Exclude from processing.
+# The following items will not be processed, by default.
+# Any item listed under the `exclude:` key here will be automatically added to
+# the internal "default list".
+#
+# Excluded items can be processed by explicitly listing the directories or
+# their entries' file path in the `include:` list.
+#
+exclude:
+  - .sass-cache/
+  - .jekyll-cache/
+  - gemfiles/
+  - Gemfile
+  - Gemfile.lock
+  - node_modules/
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
+  # 지킬 소스가 이 폴더(jekyll/) 하위로 격리돼 있어서 data/·models/·db/ 등
+  # 저장소 루트의 대용량/바이너리 디렉토리는 애초에 지킬 스캔 범위 밖이다
+  # (예전엔 지킬이 저장소 루트에서 돌아서 이 항목들을 명시적으로 빼야 했다).
+
+# 날짜가 「미래」인 문서도 빌드한다 (2026-09-22). CI 는 UTC 라 한국 시각 오전에 만든 티켓·로그(date: 오늘)가
+# 기본값(false)에선 빠져 /kanban/ 링크가 깨졌다 — PR #109 jekyll 검사 실패가 그 사례다.
+future: true

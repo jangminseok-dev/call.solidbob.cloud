@@ -1,0 +1,602 @@
+# Requirement: [Task 1] FastAPI 앱 골격, SEC-2
+"""CallGuard FastAPI 코어 — 엔트리포인트 = 합성 루트.
+
+실행 (server/ 에서):
+    uvicorn main:app --reload --env-file ../.env
+
+이 파일은 앱을 조립만 한다. 라우터는 각 앱의 adapter/inbound/api/v1/ 에, 파이프라인 배선은 hub 에 둔다
+(docs/architecture.md). 스포크 구현체는 여기서 `app.dependency_overrides[<hub 프로바이더>] = <스포크 프로바이더>`
+로 꽂는다 — 허브의 `app`·`adapter` 는 `ai/` 스포크를 모르고(`.importlinter` 계약 2), 이 파일만 양쪽을 안다.
+(⚠ 옛 주석의 「계약 5」는 `.importlinter` 에 없다 — 계약은 넷이다. `server/` 안 스포크의 기본 구현은 `hub/dependencies/` 가 직접 import 한다.)
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+# apps/ 를 경로에 올려 각 앱(hub·evaluation·<스포크>)을 최상위 패키지로 인식시킨다.
+# pytest.ini(pythonpath)·.importlinter(PYTHONPATH=apps) 와 같은 맥락 — 세 곳이 항상 같아야 한다.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "apps"))
+
+logger = logging.getLogger(__name__)
+
+from fastapi import Depends, FastAPI, Request  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+
+from admin_auth.adapter.inbound.api.v1.auth_router import auth_router  # noqa: E402
+from agent_auth.adapter.inbound.api.v1.agent_directory_router import agent_directory_router  # noqa: E402
+from agent_auth.adapter.inbound.api.v1.agent_hired_on_router import agent_hired_on_router  # noqa: E402
+from agent_auth.adapter.inbound.api.v1.agent_me_router import agent_me_router  # noqa: E402
+from agent_auth.adapter.inbound.api.v1.agent_token_router import agent_token_router  # noqa: E402
+from core.config import Settings, load_settings  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_decision_router import blacklist_decision_router  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_entry_list_router import blacklist_entry_list_router  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_expiry_change_list_router import blacklist_expiry_change_list_router  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_expiry_change_router import blacklist_expiry_change_router  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_release_router import blacklist_release_router  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_retention_purge_router import blacklist_retention_purge_router  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_request_create_router import blacklist_request_create_router  # noqa: E402
+from hub.adapter.inbound.api.v1.blacklist_request_list_router import blacklist_request_list_router  # noqa: E402
+from hub.adapter.inbound.api.v1.call_guard_check_router import call_guard_check_router  # noqa: E402
+from hub.adapter.inbound.api.v1.admin_stats_router import admin_stats_router  # noqa: E402
+from hub.adapter.inbound.api.v1.call_guard_flag_list_router import call_guard_flag_list_router  # noqa: E402
+from hub.adapter.inbound.api.v1.call_list_router import call_list_router  # noqa: E402
+from hub.adapter.inbound.api.v1.call_record_router import call_record_router  # noqa: E402
+from hub.adapter.inbound.api.v1.call_start_router import call_start_router  # noqa: E402
+from hub.adapter.inbound.api.v1.card_feedback_router import card_feedback_router  # noqa: E402
+from hub.adapter.inbound.api.v1.closure_router import closure_router  # noqa: E402
+from hub.adapter.inbound.api.v1.compliance_router import compliance_router  # noqa: E402
+from hub.adapter.inbound.api.v1.customer_briefing_router import customer_briefing_router  # noqa: E402
+from hub.adapter.inbound.api.v1.knowledge_gap_query_router import (  # noqa: E402
+    knowledge_gap_query_router,
+)
+from hub.adapter.inbound.api.v1.knowledge_gap_router import knowledge_gap_router  # noqa: E402
+from hub.adapter.inbound.api.v1.my_blacklist_request_list_router import my_blacklist_request_list_router  # noqa: E402
+from hub.adapter.inbound.api.v1.myself_router import myself_router  # noqa: E402
+from hub.adapter.inbound.api.v1.postcall_router import postcall_router  # noqa: E402
+from hub.adapter.inbound.api.v1.recommendation_router import recommendation_router  # noqa: E402
+from hub.adapter.inbound.api.v1.required_docs_detection_router import required_docs_detection_router  # noqa: E402
+from hub.adapter.inbound.api.v1.routing_decision_router import routing_decision_router  # noqa: E402
+from hub.adapter.inbound.api.v1.routing_setting_query_router import routing_setting_query_router  # noqa: E402
+from hub.adapter.inbound.api.v1.routing_setting_router import routing_setting_router  # noqa: E402
+from hub.adapter.inbound.api.v1.search_router import search_router  # noqa: E402
+from hub.adapter.inbound.api.v1.summary_confirmation_router import summary_confirmation_router  # noqa: E402
+from hub.adapter.inbound.api.v1.summary_revision_list_router import summary_revision_list_router  # noqa: E402
+from hub.adapter.inbound.api.v1.summary_revision_router import summary_revision_router  # noqa: E402
+from hub.adapter.inbound.api.v1.transcript_ingest_router import transcript_ingest_router  # noqa: E402
+from hub.adapter.inbound.api.v1.transcript_query_router import transcript_query_router  # noqa: E402
+from hub.adapter.inbound.api.v1.upload_router import upload_router  # noqa: E402
+from hub.dependencies.ingest_guard import ingest_guard_state, require_ingest_service  # noqa: E402
+from hub.dependencies.read_guard import read_guard_state, require_reader  # noqa: E402
+from hub.dependencies.transcript_cipher_provider import transcript_cipher_of  # noqa: E402
+
+SPOKES: list[str] = []  # 스포크를 꽂을 때 이름을 추가한다 — /health 가 그대로 보고한다
+
+# `server/` 안에 사는 규칙 기반 스포크. 프로바이더 기본값이라 조건 없이 붙는다.
+_BUILTIN_SPOKES = ("masking", "closure_gate", "postcall", "briefing")
+
+AI_APPS = Path(__file__).resolve().parent.parent / "ai" / "apps"
+
+
+def _wire_retrieval(app: FastAPI, settings: Settings) -> str | None:
+    """`ai/` 의 검색 구현(B-2)을 꽂는다. 꽂았으면 이름을, 못 꽂았으면 None.
+
+    **왜 여기서 꽂나.** `hub` 는 스포크를 import 하지 않는다(`.importlinter` 계약 2 —
+    `server → ai` 금지). 이 파일은 **합성 루트**라 계약 대상이 아니고, 양쪽을 아는 유일한
+    지점이다. `scripts/run_eval.py` 가 평가 경로에 대해 하는 일을 여기서 요청 경로에 대해 한다.
+
+    **`ai/` 는 서비스가 아니라 라이브러리다** — `ai/requirements.txt` 에 웹 프레임워크가 없고
+    HTTP 표면도 없다. 그래서 HTTP 로 부르지 않고 같은 프로세스에서 쓴다.
+    근거·되돌리는 법: `_project/decisions/024`.
+
+    **못 꽂으면 조용히 501 로 남는다** — 임시 구현을 만들지 않는다. `ai/` 의존성이 없는
+    환경(server CI)에서도 이 파일이 import 돼야 하므로 실패를 예외로 올리지 않는다.
+    다만 `/health` 의 `spokes` 가 비어 있어 밖에서 구분할 수 있다.
+    """
+    if not settings.elasticsearch_configured:
+        return None
+
+    sys.path.insert(0, str(AI_APPS))
+    try:
+        from elasticsearch import Elasticsearch  # noqa: PLC0415
+        from retrieval.adapter.outbound.es_bm25_retriever import EsBm25Retriever  # noqa: PLC0415
+        from retrieval.adapter.outbound.es_index import SINGLE_INDEX  # noqa: PLC0415
+    except ModuleNotFoundError:
+        # ai/ 를 함께 배포하지 않았거나 elasticsearch 패키지가 없다.
+        return None
+
+    from hub.dependencies.retrieval_provider import get_retrieval_port  # noqa: PLC0415
+
+    # 기동 시 ping 하지 않는다 — ES 가 잠깐 내려갔다고 서버가 못 뜨면 자막·마스킹까지 멈춘다.
+    # 붙지 못하면 검색 요청에서 실패하고, 그건 "등록 안 됨(501)"과 구분되는 정직한 오류다.
+    client = (
+        Elasticsearch(settings.elasticsearch_url, api_key=settings.elasticsearch_api_key)
+        if settings.elasticsearch_api_key
+        else Elasticsearch(settings.elasticsearch_url)
+    )
+    app.state.es_client = client   # `/health/ready` 가 같은 클라이언트로 찔러 본다
+    port = EsBm25Retriever(client, index=SINGLE_INDEX)
+    # 임베딩·리랭킹(decisions/206)은 모델 디렉터리가 설정됐을 때만. 못 뜨면 BM25 그대로다.
+    # 켜진 층은 `/health` 에 따로 싣는다 — 같은 "retrieval" 이라도 BM25 인지 dense+rerank 인지 밖에서 보여야 한다.
+    app.state.retrieval_layers = []
+    if settings.retrieval_embed_model_dir:
+        sys.path.insert(0, str(AI_APPS.parent))
+        try:
+            from provider import build_model_retriever  # noqa: PLC0415
+
+            port, app.state.retrieval_layers = build_model_retriever(
+                client,
+                index=SINGLE_INDEX,
+                embed_model_dir=settings.retrieval_embed_model_dir,
+                rerank_model_dir=settings.retrieval_rerank_model_dir,
+            )
+        except (ModuleNotFoundError, ImportError) as exc:
+            logger.warning("임베딩 층 못 띄움 — BM25 로 돈다: %s", type(exc).__name__)
+        if not app.state.retrieval_layers:
+            # **가장 자주 걸리는 것이 상대 경로다.** 모델 디렉터리를 못 찾으면 예외가 아니라 **빈 층**이 돌아온다 —
+            # 예외도 로그도 없이 BM25 로 내려가고, `/health` 를 안 보면 알 길이 없다(2026-09-24 로컬에서 실제로 겪었다).
+            # 그 상태에서는 **F-2 절차 채택의 점수 하한(`decisions/219`, dense 코사인 눈금 0.635)이 조용히 무의미해진다** —
+            # BM25 원점수는 대개 1 보다 커서 늘 통과한다. 그러면 옛 동작(1순위 무조건 채택)으로 되돌아간 것과 같다.
+            logger.warning(
+                "임베딩 모델 디렉터리를 설정했는데 층이 비었다 — BM25 로 돈다 (경로를 절대경로로 주었는가): %s",
+                settings.retrieval_embed_model_dir,
+            )
+    # 기동 전에 이미 꽂힌 것(테스트 스텁 등)은 덮지 않는다 — lifespan 은 빈 자리만 채운다.
+    app.dependency_overrides.setdefault(get_retrieval_port, lambda: port)
+    # 수동 검색만 B-6 기권을 씌운다(`decisions/135`) — 자동 추천은 그대로다(`215` 가 보류한 것이 그쪽이다).
+    # 씌울지·문턱 값은 `ai/` 가 정한다. dense 단독이 아니면 같은 포트가 돌아온다.
+    from hub.dependencies.search_provider import get_search_retrieval_port  # noqa: PLC0415
+
+    search_port = port
+    if app.state.retrieval_layers:
+        try:
+            from provider import wrap_no_answer  # noqa: PLC0415
+
+            search_port = wrap_no_answer(port, app.state.retrieval_layers)
+        except (ModuleNotFoundError, ImportError):
+            pass
+    app.dependency_overrides.setdefault(get_search_retrieval_port, lambda: search_port)
+    return "retrieval"
+
+
+def _wire_trigger(app: FastAPI) -> str | None:
+    """`ai/` 의 트리거 판정(B-1)을 꽂는다. 꽂았으면 이름을, 못 꽂았으면 None.
+
+    검색과 달리 외부 자원이 없어 설정 조건이 없다. `ai/provider.py` 의 팩토리를 그대로 쓴다 —
+    구현 선택(지금은 `IsFinalTrigger` v1)은 `ai/` 몫이고 여기는 꽂기만 한다.
+
+    ⚠ 발동 시각(`trigger_at_ms`)은 **모형값**이다 — 이벤트 도착 시각이 계약에 없어
+    "발화 종료 + 346ms(V4 실측)" 로 채운다. 발동 여부 판정은 진짜다. 평가 하네스는 이 포트를
+    일부러 꽂지 않는다(절대 원칙 10). `ai/apps/retrieval/adapter/outbound/is_final_trigger.py` 참고.
+    """
+    sys.path.insert(0, str(AI_APPS))
+    sys.path.insert(0, str(AI_APPS.parent))  # `ai/provider.py` 를 `provider` 로 import
+    try:
+        from provider import build_trigger_provider  # noqa: PLC0415
+    except ModuleNotFoundError:
+        return None  # ai/ 를 함께 배포하지 않았다 — 501 로 남는다
+
+    from hub.dependencies.trigger_provider import get_trigger_port  # noqa: PLC0415
+
+    app.dependency_overrides.setdefault(get_trigger_port, build_trigger_provider())
+    return "trigger"
+
+
+def _wire_uploads(app: FastAPI, settings: Settings) -> str | None:
+    """테스트 음성 보관(A-6)의 S3 어댑터를 꽂는다. 꽂았으면 이름을, 못 꽂았으면 None.
+
+    **버킷과 토큰이 둘 다 있어야 꽂는다.** 하나만 있으면 반쪽이다 — 버킷만 있으면 문이 없고,
+    토큰만 있으면 올릴 곳이 없다. 안 꽂히면 `get_upload_storage_port` 가 501 로 남는다.
+
+    자격증명은 여기서 다루지 않는다. boto3 기본 체인이 EC2 인스턴스 역할을 IMDSv2 로 가져온다 —
+    2026-09-14 운영 파드에서 확인했다(`역할: callguard-ec2-role`). `_project/decisions/110`.
+    """
+    if not settings.uploads_configured:
+        return None
+
+    try:
+        from hub.adapter.outbound.s3.s3_upload_storage_adapter import (  # noqa: PLC0415
+            S3UploadStorageAdapter,
+        )
+    except ModuleNotFoundError:
+        # boto3 가 없는 환경(경량 CI 설치 목록)에서도 이 파일은 import 돼야 한다.
+        return None
+
+    from hub.dependencies.upload_provider import get_upload_storage_port  # noqa: PLC0415
+
+    # 기동 시 버킷에 접근해 보지 않는다 — S3 가 잠깐 안 되는 것과 «설정 안 됨» 은 다른 문제이고,
+    # 여기서 막으면 전사·마스킹까지 못 뜬다(`_wire_retrieval` 과 같은 원칙).
+    adapter = S3UploadStorageAdapter(bucket=settings.s3_bucket, region=settings.aws_region)
+    app.dependency_overrides.setdefault(get_upload_storage_port, lambda: adapter)
+    return "uploads"
+
+
+def _wire_call_guard(app: FastAPI, settings: Settings) -> str | None:
+    """`ai/` 의 콜 가드 탐지(C-6)를 꽂는다. 꽂았으면 이름을, 못 꽂았으면 None.
+
+    트리거와 같다 — 규칙 사전뿐이라 설정 조건이 없고, 구현 선택(`RuleCallGuardAdapter` v1)은 `ai/` 몫이다.
+    못 꽂으면 `POST /hub/call-guard-checks` 가 501 로 남는다(빈 목록을 "폭언 없음"으로 돌려주지 않는다).
+    """
+    sys.path.insert(0, str(AI_APPS))
+    sys.path.insert(0, str(AI_APPS.parent))
+    try:
+        from provider import build_call_guard_provider  # noqa: PLC0415
+    except (ModuleNotFoundError, ImportError):
+        return None
+
+    from hub.dependencies.call_guard_provider import get_call_guard_port  # noqa: PLC0415
+
+    provider = build_call_guard_provider(settings.call_guard_model_dir)
+    app.dependency_overrides.setdefault(get_call_guard_port, provider)
+    # 학습한 폭언 분류기가 실제로 올라갔으면 `/health` 에 따로 알린다(`decisions/223`) — 경로가 틀리면 조용히 규칙만 돈다
+    if type(provider()).__name__ == "ModelCallGuardAdapter":
+        SPOKES.append("call_guard_model")
+    return "call_guard"
+
+
+def _wire_pii_ner(app: FastAPI, settings: Settings) -> str | None:
+    """C-5 — 규칙 마스킹(`server/apps/masking`) 위에 `ai/` 의 NER(P6·P7)을 **한 겹 더** 얹는다.
+
+    **규칙을 대체하지 않는다.** `ai/provider.py` 가 규칙 어댑터를 폴백으로 받아 두 결과의 합집합을
+    가린다 — 모델이 추론 중 실패해도 규칙 결과는 나간다. `PII_NER_MODEL_DIR` 이 비었거나 torch·모델이
+    없으면 **아무것도 바꾸지 않고** 기본 프로바이더(규칙)가 그대로 돈다. 그래서 켜졌을 때만 이름을 돌려준다 —
+    `/health` 에 `pii_ner` 가 없으면 P6·P7 은 규칙 폴백뿐이라는 뜻이다.
+
+    ⚠ 모델 로드·예열이 기동 시간에 1초 남짓 더해진다(2026-09-15 로컬 CPU 실측). 요청당 추론은 10ms 대다.
+    """
+    if not settings.pii_ner_model_dir:
+        return None
+
+    sys.path.insert(0, str(AI_APPS))
+    sys.path.insert(0, str(AI_APPS.parent))
+    try:
+        from provider import build_masking_provider  # noqa: PLC0415
+    except (ModuleNotFoundError, ImportError):
+        return None
+
+    from hub.dependencies.masking_provider import get_masking_port  # noqa: PLC0415
+    from masking.adapter.outbound.rule_masking_adapter import RuleMaskingAdapter  # noqa: PLC0415
+
+    provider, ner_enabled = build_masking_provider(
+        RuleMaskingAdapter(), ner_model_dir=settings.pii_ner_model_dir
+    )
+    if not ner_enabled:
+        return None
+    app.dependency_overrides.setdefault(get_masking_port, provider)
+    return "pii_ner"
+
+
+def _wire_generation(app: FastAPI, settings: Settings) -> str | None:
+    """B-4 — `ai/` 의 서류 목록 카드 생성을 꽂는다(`decisions/207`). 꽂았으면 이름을, 아니면 None.
+
+    **`OLLAMA_URL` 과 `GENERATION_MODEL` 이 둘 다 있어야** 켠다. 안 켜면 기본 프로바이더(스니펫 카드)가 그대로 돈다 —
+    지어내지 않는 정식 폴백이다. 기동 시 Ollama 에 붙어 보지 않는다: 생성이 실패하면 카드마다 스니펫으로 내려가므로
+    추천이 멈추지 않는다(`DocumentListCardAdapter`). ⚠ 켜면 추천 한 번에 모델 호출 1회(상위 1건)만큼 지연이 는다 —
+    로컬 실측 p95 0.9~1.0초(2026-09-15), 운영 T4 미측정.
+    """
+    if not (settings.ollama_url and settings.generation_model):
+        return None
+    sys.path.insert(0, str(AI_APPS))
+    sys.path.insert(0, str(AI_APPS.parent))
+    try:
+        from provider import build_generation_provider  # noqa: PLC0415
+    except (ModuleNotFoundError, ImportError):
+        return None
+
+    from hub.dependencies.generation_provider import get_generation_port  # noqa: PLC0415
+
+    app.dependency_overrides.setdefault(
+        get_generation_port, build_generation_provider(settings.ollama_url, model=settings.generation_model)
+    )
+    return "generation"
+
+
+def _wire_postcall_model(app: FastAPI, settings: Settings) -> str | None:
+    """D-1 모델 요약 · D-2 유형 제안을 규칙 발췌 초안(`decisions/306`) **위에** 얹는다(`w7-postcall-spoke`).
+
+    `OLLAMA_URL` 과 **모델 이름**이 있어야 켠다. 모델 이름은 `POSTCALL_MODEL` 이 먼저고, 없으면 `GENERATION_MODEL` 이다
+    (2026-10-02, `decisions/146` — 전에는 생성과 같은 스위치 하나였다). `POSTCALL_MODEL` 만 넣으면 **요약만** 켜지고
+    B-4 카드 생성은 꺼진 채다 — CPU 노드에서 추천마다 모델을 부르지 않으려고 갈랐다. 검색 스포크가 꽂혀 있으면 D-2 에 쓴다.
+    안 켜면 규칙 초안이 그대로다. 요약·유형은 전부 **초안**이고 `confirmed` 는 False 다.
+    """
+    model = settings.postcall_model or settings.generation_model
+    if not (settings.ollama_url and model):
+        return None
+    sys.path.insert(0, str(AI_APPS))
+    sys.path.insert(0, str(AI_APPS.parent))
+    try:
+        from provider import build_postcall_provider  # noqa: PLC0415
+    except (ModuleNotFoundError, ImportError):
+        return None
+
+    from hub.dependencies.postcall_provider import get_postcall_port  # noqa: PLC0415
+    from hub.dependencies.retrieval_provider import get_retrieval_port  # noqa: PLC0415
+    from postcall.adapter.outbound.rule_postcall_adapter import RulePostcallAdapter  # noqa: PLC0415
+
+    retrieval_factory = app.dependency_overrides.get(get_retrieval_port)
+    app.dependency_overrides.setdefault(
+        get_postcall_port,
+        build_postcall_provider(
+            RulePostcallAdapter(),
+            ollama_url=settings.ollama_url,
+            model=model,
+            retrieval=retrieval_factory() if retrieval_factory else None,
+        ),
+    )
+    return "postcall_model"
+
+
+def _wire_briefing_model(app: FastAPI, settings: Settings) -> str | None:
+    """F-3 통화 수신 전 브리핑의 모델 겹(`decisions/220`). 요약과 **같은 조건**이다 — 새 키 없음.
+    안 켜면 규칙 브리핑(`server/apps/briefing`)이 그대로 나간다."""
+    model = settings.postcall_model or settings.generation_model
+    if not (settings.ollama_url and model):
+        return None
+    sys.path.insert(0, str(AI_APPS))
+    sys.path.insert(0, str(AI_APPS.parent))
+    try:
+        from provider import build_briefing_provider  # noqa: PLC0415
+    except (ModuleNotFoundError, ImportError):
+        return None
+
+    from briefing.adapter.outbound.rule_briefing_adapter import RuleBriefingAdapter  # noqa: PLC0415
+    from hub.dependencies.customer_briefing_provider import get_customer_briefing_port  # noqa: PLC0415
+
+    app.dependency_overrides.setdefault(
+        get_customer_briefing_port,
+        build_briefing_provider(RuleBriefingAdapter(), ollama_url=settings.ollama_url, model=model),
+    )
+    return "briefing_model"
+
+
+def _wire_compliance(app: FastAPI) -> str | None:
+    """`ai/` 의 컴플라이언스 탐지(C-1~C-4)를 꽂는다. 콜 가드와 같다 — 규칙표뿐이라 설정 조건이 없다.
+
+    못 꽂으면 `POST /hub/compliance-checks` 가 501 로 남는다(빈 목록을 「위반 없음」으로 돌려주지 않는다).
+    """
+    sys.path.insert(0, str(AI_APPS))
+    sys.path.insert(0, str(AI_APPS.parent))
+    try:
+        from provider import build_compliance_provider  # noqa: PLC0415
+    except (ModuleNotFoundError, ImportError):
+        return None
+
+    from hub.dependencies.compliance_provider import get_compliance_port  # noqa: PLC0415
+
+    app.dependency_overrides.setdefault(get_compliance_port, build_compliance_provider())
+    return "compliance"
+
+
+def _install_missing_index_handler(app: FastAPI) -> None:
+    """ES 인덱스가 없거나 ES 에 연결하지 못할 때 500 대신 **503 + 이유**를 돌려준다.
+
+    운영 ES 에 지식베이스가 적재되지 않은 채로 검색 스포크가 꽂히면 `/hub/search`·
+    `/hub/recommendations` 가 `index_not_found_exception` 으로 500 이 났다(2026-09-08~09 실측).
+    500 은 "코드가 틀렸다"로 읽히지만 실제로는 "적재가 안 됐다"이고, 고치는 사람이 다르다.
+    기동 시 ping 으로 미리 막지 않는 이유는 `_wire_retrieval` 주석과 같다 — ES 가 잠깐
+    내려갔다고 마스킹까지 멈추면 안 된다.
+    """
+    try:
+        from elasticsearch import NotFoundError  # noqa: PLC0415
+    except ModuleNotFoundError:
+        return
+
+    from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+    async def _handler(_: Request, exc: NotFoundError) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "검색 인덱스가 없다 — 지식베이스를 적재해야 한다 "
+                               "(scripts/index_knowledge_base.py --to-es). "
+                               f"ES: {getattr(exc, 'message', str(exc))}"},
+        )
+
+    app.add_exception_handler(NotFoundError, _handler)
+
+    # ES 에 **연결 자체를** 못 할 때도 같다(2026-09-14, `w4-es-unreachable-503`) — 로컬에 ES 가 없거나
+    # 파드가 내려가 있으면 500 이었다. 인덱스 없음과 달리 고칠 곳은 적재가 아니라 ES 기동이다.
+    # 예외 메시지에는 ES 주소가 들어 있어 본문에 싣지 않는다(SEC-2).
+    from elasticsearch import ConnectionError as EsConnectionError  # noqa: PLC0415
+    from elasticsearch import ConnectionTimeout as EsConnectionTimeout  # noqa: PLC0415
+
+    async def _unreachable(_: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "검색 엔진(Elasticsearch)에 연결하지 못했다 — ES 가 떠 있는지 확인해야 한다 "
+                               f"({type(exc).__name__})"},
+        )
+
+    app.add_exception_handler(EsConnectionError, _unreachable)
+    app.add_exception_handler(EsConnectionTimeout, _unreachable)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = load_settings()
+    # 전사 암호화 키를 기동 때 한 번 만들어 본다 — 형식이 틀리면 여기서 ValueError 가 나고 서버가 뜨지 않는다(`decisions/326`).
+    # 요청마다 만들다 처음 실패하면 그때까지 쓴 전사가 평문인지 암호문인지 갈리고, 실패는 전사 저장 500 으로만 보인다
+    transcript_cipher_of(settings)
+    app.state.settings = settings
+
+    SPOKES.clear()
+    SPOKES.extend(_BUILTIN_SPOKES)
+    for wired in (
+        _wire_retrieval(app, settings),
+        _wire_trigger(app),
+        _wire_call_guard(app, settings),
+        _wire_compliance(app),
+        _wire_pii_ner(app, settings),
+        _wire_generation(app, settings),
+        _wire_postcall_model(app, settings),
+        _wire_briefing_model(app, settings),
+        _wire_uploads(app, settings),
+    ):
+        if wired:
+            SPOKES.append(wired)
+    SPOKES.extend(getattr(app.state, "retrieval_layers", ()))
+    yield
+
+
+app = FastAPI(
+    title="CallGuard Core",
+    summary="실시간 상담원 어시스트 RAG — FastAPI 코어",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+# CORS 는 미들웨어라 기동 전에 붙어야 한다(Starlette 는 시작 뒤 add_middleware 를 거부한다).
+# 그래서 lifespan 의 settings 를 기다리지 않고 여기서 한 번 더 읽는다 — 이 값 하나만이다.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(load_settings().cors_allowed_origins),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+_install_missing_index_handler(app)
+
+# **콜 미디에이터만 부르는 쓰기 경로**에 서비스 토큰 문을 단다(`_project/decisions/120`).
+# 2026-09-20 운영 왕복에서 이 일곱이 토큰 없이 200 이었다. 프론트 세 앱은 이 경로를 한 곳도 부르지 않는다(전수 grep) —
+# 대시보드가 직접 부르는 쓰기(`/close`·요약 확정·카드 피드백)는 **사람 토큰(`require_agent`) 몫**이라 여기 넣지 않는다 —
+# 각 라우터가 자기 문을 단다(`/close` 는 상담원 토큰 또는 서비스 토큰, 카드 피드백은 신원을 버리는 상담원 토큰 — `decisions/315`).
+# 일곱 라우터 모두 라우트가 하나뿐이라 합성 루트에서 한 번에 건다 — GET `/hub/calls`(목록)는 다른 라우터라 영향이 없다.
+# 여덟째 `/hub/routing-decisions`(J-5 배정 판정)는 2026-09-22 에 더했다 — 콜 미디에이터가 통화 시작 직후 부른다(`decisions/126`).
+# 부르는 곳이 생기기 **전에** 잠갔다(프론트는 부르지 않는다, 전수 grep).
+_INGEST_ONLY = [Depends(require_ingest_service)]
+# 읽기 넷(통화 목록·전사·통화 기록·수동 검색)의 문 — 상담원 토큰 또는 서비스 토큰(`decisions/322`). 토큰 없는 요청은
+# `READ_AUTH_REQUIRED` 를 켜야 막힌다(상담원 화면이 토큰을 싣기 전 이행기). 관리자 쪽 지식 공백은 각 라우터가 관리자 문을 단다.
+_READERS = [Depends(require_reader)]
+
+app.include_router(auth_router)
+app.include_router(admin_stats_router)
+app.include_router(agent_directory_router)
+app.include_router(agent_hired_on_router)
+app.include_router(agent_me_router)
+app.include_router(agent_token_router)
+app.include_router(blacklist_decision_router)
+app.include_router(blacklist_entry_list_router)
+app.include_router(blacklist_expiry_change_router)
+app.include_router(blacklist_expiry_change_list_router)
+app.include_router(blacklist_release_router)
+app.include_router(blacklist_retention_purge_router)
+app.include_router(blacklist_request_create_router)
+app.include_router(blacklist_request_list_router)
+app.include_router(call_guard_check_router, dependencies=_INGEST_ONLY)
+app.include_router(call_guard_flag_list_router)
+app.include_router(call_list_router, dependencies=_READERS)
+app.include_router(call_record_router, dependencies=_READERS)
+app.include_router(customer_briefing_router, dependencies=_READERS)
+app.include_router(call_start_router, dependencies=_INGEST_ONLY)
+app.include_router(card_feedback_router)
+app.include_router(closure_router, dependencies=_INGEST_ONLY)
+app.include_router(compliance_router, dependencies=_INGEST_ONLY)
+app.include_router(knowledge_gap_query_router)
+app.include_router(knowledge_gap_router)
+app.include_router(my_blacklist_request_list_router)
+app.include_router(myself_router)
+app.include_router(postcall_router)
+app.include_router(summary_confirmation_router)
+app.include_router(summary_revision_router)
+app.include_router(summary_revision_list_router)
+app.include_router(recommendation_router, dependencies=_INGEST_ONLY)
+app.include_router(required_docs_detection_router, dependencies=_INGEST_ONLY)
+app.include_router(routing_decision_router, dependencies=_INGEST_ONLY)
+app.include_router(routing_setting_router)
+app.include_router(routing_setting_query_router)
+app.include_router(search_router, dependencies=_READERS)
+app.include_router(transcript_ingest_router, dependencies=_INGEST_ONLY)
+app.include_router(transcript_query_router, dependencies=_READERS)
+app.include_router(upload_router)
+
+
+@app.get("/health")
+def health(request: Request) -> dict:
+    """기동 여부 + 외부 자원 설정 여부 + 등록된 스포크. 설정 '값'은 절대 싣지 않는다 (SEC-2).
+
+    ⚠ **여기서 `true` 는 「설정이 있다」이지 「붙는다」가 아니다.** 실제 연결은 `/health/ready` 가 본다.
+    """
+    settings: Settings = request.app.state.settings
+    return {
+        "status": "ok",
+        "postgres_configured": settings.postgres_configured,
+        "elasticsearch_configured": settings.elasticsearch_configured,
+        "spokes": list(SPOKES),
+        # "unset" = 토큰 미설정이라 쓰기 경로가 전부 401 이다. 값이 아니라 **상태**만 싣는다(SEC-2)
+        "ingest_guard": ingest_guard_state(settings),
+        # "open" = 토큰 없는 읽기가 지나간다(이행기, decisions/322). "locked" = READ_AUTH_REQUIRED
+        "read_guard": read_guard_state(settings),
+        # "on" = 전사 본문을 암호화해 저장한다. "unset" = 키가 없어 마스킹본 평문으로 저장한다(`decisions/326`). 키 값은 싣지 않는다
+        "transcript_encryption": "on" if settings.transcript_enc_key else "unset",
+        # 배포된 이미지 태그(빌드 인자 APP_VERSION). 로컬은 "unknown" — 지어내지 않는다
+        "version": settings.app_version or "unknown",
+    }
+
+
+READY_TIMEOUT_SECONDS = 3.0
+
+
+async def _probe(fn) -> dict:
+    """한 자원을 찔러 보고 결과만 돌려준다. **예외 메시지는 싣지 않는다 (SEC-2)** —
+    접속 문자열·호스트·비밀번호가 그 안에 들어 있다. 타입 이름만 남긴다."""
+    import asyncio  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    started = time.perf_counter()
+    try:
+        await asyncio.wait_for(fn(), timeout=READY_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 — 어떤 실패든 「못 붙었다」로 같게 다룬다
+        return {"configured": True, "ok": False, "error": type(exc).__name__,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000)}
+    return {"configured": True, "ok": True, "elapsed_ms": round((time.perf_counter() - started) * 1000)}
+
+
+@app.get("/health/ready")
+async def health_ready(request: Request) -> JSONResponse:
+    """**설정이 아니라 연결을 잰다.** PostgreSQL 은 `select 1`, ES 는 ping.
+
+    **왜 `/health` 를 고치지 않고 주소를 나눴나.** `/health` 는 기동 확인(liveness)이고 배포
+    스모크 테스트가 매번 친다 — 여기서 DB·ES 를 찌르면 검사가 느려지고, 자원이 잠깐 흔들릴 때
+    「서버가 죽었다」로 읽힌다. 반대로 `/health` 만 있으면 **「설정은 있는데 실제로는 안 붙는」
+    상태가 「정상」으로 보고된다** — 2026-09-14 에 그래서 결함이 가려졌다(`connection.py` 주석).
+    그래서 **싼 것과 진짜인 것을 다른 주소로 가른다.**
+
+    - 설정이 없는 자원은 **실패로 세지 않는다**(`configured: false`) — 그건 `/health` 가 이미 말한다.
+    - 설정된 자원 중 하나라도 못 붙으면 **503** 과 `status: "degraded"`.
+    - ⚠ **지금 어떤 k8s 프로브도 이 주소를 쓰지 않는다.** 붙이려면 파드가 ES 흔들림에
+      휩쓸려 서비스에서 빠지는 것을 먼저 받아들여야 한다(런북 19장).
+    """
+    settings: Settings = request.app.state.settings
+    checks: dict[str, dict] = {}
+
+    if not settings.postgres_configured:
+        checks["postgres"] = {"configured": False}
+    else:
+        async def _pg() -> None:
+            from hub.adapter.outbound.postgres.connection import build_connection_factory  # noqa: PLC0415
+
+            connect = build_connection_factory(settings)
+            async with connect() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("select 1")
+        checks["postgres"] = await _probe(_pg)
+
+    client = getattr(request.app.state, "es_client", None)
+    if not settings.elasticsearch_configured or client is None:
+        checks["elasticsearch"] = {"configured": settings.elasticsearch_configured, "ok": None,
+                                   "error": None if not settings.elasticsearch_configured else "client_not_wired"}
+    else:
+        async def _es() -> None:
+            import asyncio  # noqa: PLC0415
+
+            if not await asyncio.to_thread(client.ping):
+                raise ConnectionError("ping false")
+        checks["elasticsearch"] = await _probe(_es)
+
+    degraded = [n for n, c in checks.items() if c.get("configured") and c.get("ok") is not True]
+    return JSONResponse(
+        status_code=200 if not degraded else 503,
+        content={"status": "ok" if not degraded else "degraded", "checks": checks},
+    )

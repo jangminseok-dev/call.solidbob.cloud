@@ -1,0 +1,70 @@
+# Requirement: J-1
+from __future__ import annotations
+
+from admin_auth.app.ports.output.admin_account_port import AdminAccountPort
+from admin_auth.dependencies.providers import get_admin_account_port
+from fastapi import Depends
+
+from agent_auth.app.ports.input.admin_agent_link_use_case import AdminAgentLinkUseCase
+from agent_auth.app.ports.input.agent_directory_list_use_case import AgentDirectoryListUseCase
+from agent_auth.app.ports.input.agent_hired_on_use_case import AgentHiredOnUseCase
+from agent_auth.app.ports.input.agent_profile_use_case import AgentProfileUseCase
+from agent_auth.app.ports.input.agent_token_list_use_case import AgentTokenListUseCase
+from agent_auth.app.ports.input.current_agent_use_case import CurrentAgentUseCase
+from agent_auth.app.ports.input.issue_agent_token_use_case import IssueAgentTokenUseCase
+from agent_auth.app.ports.input.revoke_agent_token_use_case import RevokeAgentTokenUseCase
+from agent_auth.app.ports.output.agent_directory_port import AgentDirectoryPort
+from agent_auth.app.ports.output.agent_token_port import AgentTokenPort
+from agent_auth.app.use_cases.admin_agent_link_interactor import AdminAgentLinkInteractor
+from agent_auth.app.use_cases.agent_directory_list_interactor import AgentDirectoryListInteractor
+from agent_auth.app.use_cases.agent_hired_on_interactor import AgentHiredOnInteractor
+from agent_auth.app.use_cases.agent_profile_interactor import AgentProfileInteractor
+from agent_auth.app.use_cases.agent_token_list_interactor import AgentTokenListInteractor
+from agent_auth.app.use_cases.current_agent_interactor import CurrentAgentInteractor
+from agent_auth.app.use_cases.issue_agent_token_interactor import IssueAgentTokenInteractor
+from agent_auth.app.use_cases.revoke_agent_token_interactor import RevokeAgentTokenInteractor
+from agent_auth.dependencies.providers import get_agent_directory_port, get_agent_token_port
+
+
+def get_issue_agent_token_use_case(
+    tokens: AgentTokenPort = Depends(get_agent_token_port),
+    agents: AgentDirectoryPort = Depends(get_agent_directory_port),
+) -> IssueAgentTokenUseCase:
+    return IssueAgentTokenInteractor(tokens, agents)
+
+
+def get_current_agent_use_case(tokens: AgentTokenPort = Depends(get_agent_token_port)) -> CurrentAgentUseCase:
+    return CurrentAgentInteractor(tokens)
+
+
+def get_agent_token_list_use_case(tokens: AgentTokenPort = Depends(get_agent_token_port)) -> AgentTokenListUseCase:
+    return AgentTokenListInteractor(tokens)
+
+
+def get_revoke_agent_token_use_case(tokens: AgentTokenPort = Depends(get_agent_token_port)) -> RevokeAgentTokenUseCase:
+    return RevokeAgentTokenInteractor(tokens)
+
+
+def get_agent_directory_list_use_case(
+    agents: AgentDirectoryPort = Depends(get_agent_directory_port),
+) -> AgentDirectoryListUseCase:
+    return AgentDirectoryListInteractor(agents)
+
+
+def get_agent_profile_use_case(
+    agents: AgentDirectoryPort = Depends(get_agent_directory_port),
+) -> AgentProfileUseCase:
+    return AgentProfileInteractor(agents)
+
+
+def get_admin_agent_link_use_case(
+    agents: AgentDirectoryPort = Depends(get_agent_directory_port),
+    admins: AdminAccountPort = Depends(get_admin_account_port),
+) -> AdminAgentLinkUseCase:
+    return AdminAgentLinkInteractor(agents, admins)
+
+
+def get_agent_hired_on_use_case(
+    agents: AgentDirectoryPort = Depends(get_agent_directory_port),
+) -> AgentHiredOnUseCase:
+    return AgentHiredOnInteractor(agents)

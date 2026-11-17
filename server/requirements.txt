@@ -1,0 +1,48 @@
+# CallGuard server/ — 런타임 파이프라인 의존성.
+# 2026-08-26 fastapi/ 를 server/ · ai/ 로 나누면서 분리했다.
+#
+# 여기에는 **요청을 처리하는 데 필요한 것만** 둔다. 모델 학습·검색 실험 의존성
+# (torch·transformers·langchain 등)은 ai/requirements.txt 에 있다.
+# 섞으면 서버 컨테이너가 수 GB 커지고, CI 가 쓰지도 않는 것을 설치한다.
+#
+# Python 3.13 (pyenv). 설치 (저장소 루트에서 — .venv 는 루트에 둔다,
+# scripts/check_requirements_updates.py 가 그 경로를 본다):
+#   python3.13 -m venv .venv && source .venv/bin/activate
+#   pip install -r server/requirements.txt
+#
+# 버전은 매주 월요일 09:00에 로컬 launchd(com.callguard.requirements-check)가 PyPI
+# 최신 버전을 확인해 이 파일과 .venv를 자동 갱신한다 (scripts/check_requirements_updates.py).
+
+# --- 런타임 ---
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.4
+python-dotenv==1.2.3   # uvicorn --env-file (CLAUDE.md 실행 명령) 이 요구한다. 운영(k8s env)은 안 쓴다
+
+# --- PostgreSQL (SEC-1 저장 경로) — 포트가 async 라 async 드라이버를 쓴다.
+#     adapter/outbound/postgres/ 에서만 import 한다 (.importlinter 계약 3).
+#     psycopg3 를 쓰는 이유: %s 플레이스홀더가 그대로라 SQL 이 방언 전환에 덜 흔들린다
+#     (asyncpg 는 $1 형식이라 전 쿼리를 고쳐야 한다). 2026-08-27 전환 — decisions/018
+psycopg[binary]==3.2.10
+
+# --- STT (A-1) — 콜 미디에이터가 보낸 오디오를 처리하는 경로 ---
+google-cloud-speech==2.40.0
+
+# --- 테스트 음성 보관 (A-6, 2026-09-14 `_project/decisions/110`) ---
+# hub/adapter/outbound/s3/ 에서만 import 한다. 자격증명은 코드가 다루지 않는다 —
+# 기본 체인이 EC2 인스턴스 역할을 IMDSv2 로 가져온다(운영 파드 확인).
+boto3==1.35.76
+
+# --- 관리자 로그인(구글, 2026-09-14) — admin_auth/adapter/outbound 에서만 import 한다 ---
+PyJWT==2.10.1                # access token 서명(HS256)
+redis==5.2.1                  # access token 세션 저장 — 테스트 스코프(ElastiCache 아님, infra/CLAUDE.md §1-2)
+google-auth==2.36.0           # 구글 id_token 검증(서명·issuer·audience)
+
+# --- 전사 본문 암호화(AES-256-GCM, 2026-10-06 `decisions/326`) — hub/adapter/outbound/transcript_text_cipher.py 에서만 import 한다 ---
+# google-auth 가 이미 끌어오던 것을 직접 고정한다 — 간접 의존에 기대면 그쪽이 빠질 때 조용히 사라진다
+cryptography==50.0.1
+
+# --- 검증 ---
+pytest==9.1.1
+httpx==0.28.1
+import-linter==2.13

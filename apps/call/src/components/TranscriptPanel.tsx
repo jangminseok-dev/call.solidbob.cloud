@@ -1,0 +1,971 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactElement,
+  type UIEvent,
+} from "react";
+import { BrandLockup } from "./AppHeader";
+import { MaskedText } from "./MaskedText";
+import { isCoreApiConfigured } from "../lib/api/coreClient";
+import { formatOffsetMs } from "../lib/text/codepoints";
+import { formatCallStartedAt } from "../lib/formatCallTime";
+import { findMatches, type CharRange } from "../lib/text/highlight";
+import { ManualSearchBar } from "./ManualSearchBar";
+import {
+  ComplianceUnavailableNotice,
+  ComplianceWarningBanner,
+} from "./ComplianceWarningBanner";
+import { CustomerRiskBanner } from "./CustomerRiskBanner";
+import { LanguageBadge } from "./LanguageBadge";
+import { detectComplianceRisk } from "../lib/compliance/detectComplianceRisk";
+import { detectCustomerRisk } from "../lib/customerRisk/detectCustomerRisk";
+import type { BannerRiskMatch } from "../lib/customerRisk/detectCustomerRisk";
+import type { CustomerRiskMatch } from "../lib/customerRisk/detectCustomerRisk";
+import { targetLanguageFromCode } from "../lib/language/languageMeta";
+import {
+  maskSensitiveText,
+  sensitiveRanges,
+} from "../lib/customerRisk/maskSensitiveText";
+import {
+  logSupervisorAlert,
+  type SupervisorAlert,
+} from "../lib/customerRisk/supervisorAlert";
+import type { ManualSearchOutcome } from "../hooks/useCallMediatorSession";
+import { useCallStore, type Utterance } from "../store/callStore";
+import { isCallGuardDistress } from "../types/contract";
+import type { CallGuardFlag, ComplianceFinding, TranscriptQuerySegment } from "../types/contract";
+
+/** 화면에 그릴 컴플라이언스 경고 한 건 — 실서버 findings/로컬 mock 규칙을 같은 모양으로 맞춘다. */
+interface LineCompliance {
+  key: string;
+  detectedPhrase: string;
+  suggestedPhrase: string;
+}
+
+function complianceFromFindings(
+  findings: readonly ComplianceFinding[],
+): LineCompliance[] {
+  return findings.map((f) => ({
+    key: `${f.rule_code}:${f.phrase}`,
+    detectedPhrase: f.phrase,
+    suggestedPhrase:
+      f.alternative_source?.title ?? "권장 대체 표현이 등록되지 않았습니다.",
+  }));
+}
+
+/**
+ * 서버 `alternative_source` 가 대체 표현이 아니라 **근거 조항 ID**(`DASAN-…`)만 실어 올 때가 있다 —
+ * 그걸 「권장 표현」이라고 붙이면 상담원이 조항 번호를 읽으라는 말로 본다(QA 2회차 관찰). 이름을 사실대로 바꾼다.
+ */
+export function complianceLabel(suggestedPhrase: string): string {
+  return /^DASAN-[A-Z]+-\d/.test(suggestedPhrase.trim()) ? "근거 조항" : "권장 표현";
+}
+
+/** 이 거리 안이면 맨 아래에 있는 것으로 본다. */
+const PIN_THRESHOLD_PX = 80;
+const SMOOTH_LOCK_MS = 420;
+
+interface SearchMatch {
+  segmentId: string;
+  range: CharRange;
+}
+
+interface TranscriptPanelProps {
+  onManualSearch: (query: string) => Promise<ManualSearchOutcome>;
+  onSupervisorAlert?: (alert: SupervisorAlert) => void;
+}
+
+const CUSTOMER_GUIDANCE = {
+  abuse: "안전 문구 사용을 권장합니다",
+  distress: "슈퍼바이저 연결을 고려하세요",
+} as const;
+
+/**
+ * C-6 — 갈래별 안내 문구. 매뉴얼 5장(`knowledge-base/dasan/manual/MANUAL.md`)을 그대로 옮겼다.
+ * 전에는 위기 신호 말고는 전부 「고객이 흥분한 상태입니다. 안내는 이어가시면 됩니다」 한 줄이라
+ * 협박(5.2 — 1차 안내 뒤 곧바로 종료 가능)에 매뉴얼과 반대되는 안내가 붙었다(QA 2회차 Q-29·Q-30).
+ * 판단은 상담원·상급자 몫이다 — 시스템은 탐지와 경고까지만 한다(5.2). 위험도·점수는 쓰지 않는다(부록 A-1).
+ */
+export const CALL_GUARD_COPY: Record<
+  CallGuardFlag["category"],
+  { pill: string; hint: string; source: string }
+> = {
+  insult: {
+    pill: "🚫 상담원 보호 알림",
+    hint: "욕설·모욕이 잡혔습니다. 업무와 무관한 표현을 삼가 달라고 1차 안내하고, 계속되면 통화가 종료될 수 있음을 2차 안내하세요. 같은 방식으로 대응하지 않습니다.",
+    source: "DASAN-MANUAL-5.1",
+  },
+  threat: {
+    pill: "🚫 상담원 보호 알림",
+    hint: "신체적 위해를 암시하는 협박이 잡혔습니다. 1차 안내 뒤 곧바로 통화를 종료할 수 있습니다 — 종료 사유와 시각을 기록하세요. 종료 판단은 상담원과 상급자 몫입니다.",
+    source: "DASAN-MANUAL-5.2",
+  },
+  sexual: {
+    pill: "🚫 상담원 보호 알림",
+    hint: "성적 표현이 잡혔습니다. 1차 안내 뒤 곧바로 통화를 종료할 수 있습니다 — 종료 사유와 시각을 기록하세요.",
+    source: "DASAN-MANUAL-5.2",
+  },
+  distress: {
+    pill: "🆘 위기 신호",
+    hint: "통화를 끊지 말고 전문 상담 기관 연결을 우선하세요. 위험 정도를 판단하거나 설득하지 않습니다.",
+    source: "DASAN-MANUAL-5.4",
+  },
+};
+
+function uniqueCustomerBanners(
+  risks: readonly CustomerRiskMatch[],
+): BannerRiskMatch[] {
+  const seen = new Set<"abuse" | "distress">();
+  const out: BannerRiskMatch[] = [];
+  for (const risk of risks) {
+    if (risk.type === "pii" || seen.has(risk.type)) {
+      continue;
+    }
+    seen.add(risk.type);
+    out.push(risk as BannerRiskMatch);
+  }
+  return out;
+}
+
+function historyAsUtterance(segment: TranscriptQuerySegment): Utterance {
+  return {
+    segment_id: String(segment.segment_id),
+    speaker: segment.speaker,
+    text: segment.text,
+    masked: segment.masked,
+    is_final: segment.is_final,
+    utterance_end_ms: segment.utterance_end_ms ?? 0,
+  };
+}
+
+export function TranscriptPanel({
+  onManualSearch,
+  onSupervisorAlert = logSupervisorAlert,
+}: TranscriptPanelProps): ReactElement {
+  const liveUtterances = useCallStore((state) => state.utterances);
+  const translations = useCallStore((state) =>
+    state.viewMode === "history"
+      ? state.historyTranslations
+      : state.translations,
+  );
+  const agentTts = useCallStore((state) =>
+    state.viewMode === "history" ? state.historyAgentTts : state.agentTts,
+  );
+  const callGuard = useCallStore((state) =>
+    state.viewMode === "history" ? state.historyCallGuard : state.callGuard,
+  );
+  // 상담기록 재생에는 저장되지 않는다(실시간 통화 전용) — history 모드에서는 항상 빈 채로
+  // 정직하게 남는다(mock으로 채우지 않는다).
+  const complianceFindings = useCallStore((state) => state.compliance);
+  const complianceUnavailable = useCallStore(
+    (state) => state.complianceUnavailable,
+  );
+  const noDocsSegments = useCallStore((state) => state.noDocsSegments);
+  const accentHints = useCallStore((state) =>
+    state.viewMode === "history" ? state.historyAccentHints : state.accentHints,
+  );
+  const viewMode = useCallStore((state) => state.viewMode);
+  const historySegments = useCallStore((state) => state.historySegments);
+  const historyStartedAt = useCallStore((state) => state.historyStartedAt);
+  const resumeLive = useCallStore((state) => state.resumeLive);
+  const isHistory = viewMode === "history";
+  const utterances = useMemo(
+    () =>
+      isHistory
+        ? historySegments.map(historyAsUtterance)
+        : liveUtterances,
+    [isHistory, historySegments, liveUtterances],
+  );
+  const historyCallId = useCallStore((state) => state.historyCallId);
+  const setHistoryView = useCallStore((state) => state.setHistoryView);
+  const callId = useCallStore((state) => state.callId);
+  const routingDecision = useCallStore((state) => state.routingDecision);
+  const targetLanguage = useCallStore((state) =>
+    state.viewMode === "history"
+      ? state.historyTargetLanguage
+      : state.targetLanguage,
+  );
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(new Set());
+  const [notifiedKeys, setNotifiedKeys] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const notifiedRef = useRef(new Set<string>());
+  const prevModeRef = useRef(viewMode);
+
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const itemRefs = useRef(new Map<string, HTMLLIElement>());
+  const pinnedRef = useRef(true);
+  const autoScrollingRef = useRef(false);
+  const unlockRef = useRef<number | null>(null);
+
+  const [showJump, setShowJump] = useState(false);
+  const [query, setQuery] = useState("");
+  const [hitIndex, setHitIndex] = useState(0);
+
+  useEffect(() => {
+    if (prevModeRef.current === "history" && viewMode === "live") {
+      pinnedRef.current = true;
+      setShowJump(false);
+    }
+    prevModeRef.current = viewMode;
+  }, [viewMode]);
+
+  useEffect(() => {
+    setDismissed(new Set());
+    notifiedRef.current = new Set();
+    setNotifiedKeys(new Set());
+  }, [callId, historyCallId, viewMode]);
+
+  useEffect(() => {
+    // 실서버 모드에서는 detectCustomerRisk(임시 키워드 감지기)를 부르지 않는다 —
+    // 서버가 실제 call_guard로 슈퍼바이저 개입이 필요한 상황을 이미 알려준다.
+    if (isHistory || isCoreApiConfigured()) {
+      return;
+    }
+    const fresh: SupervisorAlert[] = [];
+    const keys: string[] = [];
+    for (const item of utterances) {
+      if (item.speaker !== "customer") {
+        continue;
+      }
+      for (const risk of detectCustomerRisk(item.text)) {
+        if (risk.type === "pii") {
+          continue;
+        }
+        const key = `${item.segment_id}:${risk.type}:${risk.startIndex}`;
+        if (notifiedRef.current.has(key)) {
+          continue;
+        }
+        notifiedRef.current.add(key);
+        keys.push(key);
+        fresh.push({
+          type: risk.type,
+          matchedText: risk.matchedText,
+          callId: callId ?? "",
+          timestamp: Date.now(),
+        });
+      }
+    }
+    if (keys.length === 0) {
+      return;
+    }
+    for (const alert of fresh) {
+      onSupervisorAlert(alert);
+    }
+    setNotifiedKeys((current) => {
+      const next = new Set(current);
+      for (const key of keys) {
+        next.add(key);
+      }
+      return next;
+    });
+  }, [utterances, isHistory, callId, onSupervisorAlert]);
+
+  const needle = query.trim();
+
+  const matches = useMemo<SearchMatch[]>(() => {
+    if (needle.length === 0) {
+      return [];
+    }
+    const found: SearchMatch[] = [];
+    utterances.forEach((item) => {
+      findMatches(item.text, needle).forEach((range) => {
+        found.push({ segmentId: item.segment_id, range });
+      });
+      const translated = translations[item.segment_id]?.translated_text;
+      if (translated !== undefined) {
+        findMatches(translated, needle).forEach((range) => {
+          found.push({ segmentId: `${item.segment_id}::tr`, range });
+        });
+      }
+    });
+    return found;
+  }, [utterances, needle, translations]);
+
+  const hitsBySegment = useMemo(() => {
+    const grouped = new Map<string, CharRange[]>();
+    matches.forEach((match) => {
+      const list = grouped.get(match.segmentId);
+      if (list === undefined) {
+        grouped.set(match.segmentId, [match.range]);
+      } else {
+        list.push(match.range);
+      }
+    });
+    return grouped;
+  }, [matches]);
+
+  const total = matches.length;
+  const current = total === 0 ? -1 : Math.min(hitIndex, total - 1);
+  const activeMatch = current === -1 ? null : matches[current];
+
+  const scrollToBottom = useCallback((smooth: boolean): void => {
+    const el = bodyRef.current;
+    if (el === null) {
+      return;
+    }
+    autoScrollingRef.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+
+    if (unlockRef.current !== null) {
+      window.clearTimeout(unlockRef.current);
+    }
+    unlockRef.current = window.setTimeout(
+      () => {
+        unlockRef.current = null;
+        autoScrollingRef.current = false;
+        const settled = bodyRef.current;
+        if (settled === null) {
+          return;
+        }
+        const distance =
+          settled.scrollHeight - settled.scrollTop - settled.clientHeight;
+        if (distance <= PIN_THRESHOLD_PX) {
+          pinnedRef.current = true;
+          setShowJump(false);
+        }
+      },
+      smooth ? SMOOTH_LOCK_MS : 0,
+    );
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (unlockRef.current !== null) {
+        window.clearTimeout(unlockRef.current);
+      }
+    };
+  }, []);
+
+  function onBodyScroll(event: UIEvent<HTMLDivElement>): void {
+    if (autoScrollingRef.current) {
+      return;
+    }
+    const el = event.currentTarget;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distance <= PIN_THRESHOLD_PX;
+    pinnedRef.current = atBottom;
+    if (atBottom) {
+      setShowJump(false);
+    }
+  }
+
+  useEffect(() => {
+    if (isHistory) {
+      setShowJump(false);
+      pinnedRef.current = false;
+      const el = bodyRef.current;
+      if (el !== null) {
+        el.scrollTop = 0;
+      }
+      return;
+    }
+    if (utterances.length === 0) {
+      pinnedRef.current = true;
+      setShowJump(false);
+      return;
+    }
+    // 위로 올려 과거 대화를 보는 중이면 끌어내리지 않고 알림만 띄운다.
+    if (!pinnedRef.current) {
+      setShowJump(true);
+      return;
+    }
+    const last = utterances[utterances.length - 1];
+    if (last === undefined) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      scrollToBottom(last.is_final);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [isHistory, utterances, scrollToBottom]);
+
+  function jumpToLatest(): void {
+    pinnedRef.current = true;
+    setShowJump(false);
+    scrollToBottom(true);
+  }
+
+  useEffect(() => {
+    setHitIndex(0);
+  }, [needle]);
+
+  const activeSegmentId = activeMatch === null ? null : activeMatch.segmentId;
+  const activeStart = activeMatch === null ? -1 : activeMatch.range.start;
+  const scrollSegmentId =
+    activeSegmentId === null ? null : activeSegmentId.replace(/::tr$/, "");
+
+  useEffect(() => {
+    if (scrollSegmentId === null) {
+      return;
+    }
+    const el = itemRefs.current.get(scrollSegmentId);
+    if (el === undefined) {
+      return;
+    }
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [scrollSegmentId, activeStart]);
+
+  function stepHit(delta: number): void {
+    if (total === 0) {
+      return;
+    }
+    setHitIndex((((current + delta) % total) + total) % total);
+  }
+
+  function onSearchKeyDown(event: KeyboardEvent<HTMLInputElement>): void {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      stepHit(event.shiftKey ? -1 : 1);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setQuery("");
+    }
+  }
+
+  return (
+    <section
+      className="panel transcript-panel"
+      aria-labelledby="transcript-heading"
+    >
+      <header className="pane-header left-pane-header">
+        <BrandLockup />
+      </header>
+      {isHistory && historyStartedAt !== null ? (
+        <div className="history-banner" role="status">
+          <span>
+            지난 통화 보는 중 · {formatCallStartedAt(historyStartedAt)}
+          </span>
+          <button
+            type="button"
+            className="history-banner-back"
+            onClick={() => {
+              setHistoryView("record");
+            }}
+          >
+            요약 보기
+          </button>
+          <button type="button" className="history-banner-back" onClick={resumeLive}>
+            실시간으로 돌아가기
+          </button>
+        </div>
+      ) : null}
+      {/* J-5(decisions/313·126·407) — 통화 시작 직후 배정 판정이 기록된다. **판정이
+          연결을 바꾸지 않는다** — 이미 상담원이 받은 뒤의 기록이다. "배정됨"이라고
+          쓰지 않는다. 상담기록(history) 재생에는 이 값이 없다(저장 안 됨). */}
+      {!isHistory && routingDecision !== null ? (
+        <div className="history-banner" role="status">
+          <span>
+            배정 판정 기록됨 · {routingDecision.is_blacklisted ? "블랙리스트 등록 고객" : "블랙리스트 아님"}
+            {routingDecision.fell_back
+              ? " · 근속 기준 상담사 없어 일반 배정"
+              : routingDecision.is_blacklisted && routingDecision.assigned_agent_id
+                ? ` → 베테랑 상담사(${routingDecision.assigned_agent_id})에게 배정 판정`
+                : ""}
+            {" "}— 연결은 바뀌지 않습니다(시연용 기록)
+          </span>
+        </div>
+      ) : null}
+      <header className="panel-head transcript-head">
+        <div className="transcript-head-row">
+          <h2 id="transcript-heading">실시간 자막</h2>
+        </div>
+        <div className="transcript-search">
+          <svg
+            className="search-icon"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            aria-hidden="true"
+          >
+            <circle cx="10.5" cy="10.5" r="6.5" />
+            <path d="M15.5 15.5 21 21" />
+          </svg>
+          <input
+            type="text"
+            className="search-input"
+            placeholder="자막 검색"
+            aria-label="자막 검색"
+            value={query}
+            onChange={(event) => {
+              setQuery(event.target.value);
+            }}
+            onKeyDown={onSearchKeyDown}
+          />
+          {needle.length > 0 ? (
+            <div className="search-nav">
+              <span className="search-count" aria-live="polite">
+                {current + 1} / 총 {total}
+              </span>
+              <button
+                type="button"
+                className="search-step"
+                onClick={() => {
+                  stepHit(-1);
+                }}
+                disabled={total === 0}
+                aria-label="이전 검색 결과"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m6 15 6-6 6 6" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="search-step"
+                onClick={() => {
+                  stepHit(1);
+                }}
+                disabled={total === 0}
+                aria-label="다음 검색 결과"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="search-clear"
+                onClick={() => {
+                  setQuery("");
+                }}
+                aria-label="검색어 지우기"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.6"
+                  strokeLinecap="round"
+                  aria-hidden="true"
+                >
+                  <path d="M6 6 18 18M18 6 6 18" />
+                </svg>
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </header>
+
+      <div className="panel-body" ref={bodyRef} onScroll={onBodyScroll}>
+        {utterances.length === 0 ? (
+          <p className="empty">발화가 아직 없습니다.</p>
+        ) : (
+          <ol className="utterance-list">
+            {utterances.map((item) => {
+              const hasAlert = item.masked.length > 0;
+              // 위기 신호(distress)가 같은 구간의 폭언 배지에 덮이지 않도록 위로 정렬한다
+              // (w6-qa-ui-defects-three) — 스토어가 배열로 쌓아 준 걸 전부 그린다.
+              const guards = (callGuard[item.segment_id] ?? [])
+                .slice()
+                .sort((a, b) => Number(isCallGuardDistress(b)) - Number(isCallGuardDistress(a)));
+              const hits = hitsBySegment.get(item.segment_id) ?? [];
+              const translation = translations[item.segment_id];
+              const tts = agentTts[item.segment_id];
+              // 실서버 모드에서는 detectCustomerRisk(임시 키워드·정규식 감지기)를 부르지
+              // 않는다 — 운영 call-mediator가 실제 call_guard를 보내고, 화면 텍스트는
+              // 이미 서버가 마스킹해 온 것이라 이 자리표시자가 더 할 일이 없다.
+              const customerRisks =
+                item.speaker === "customer" && !isCoreApiConfigured()
+                  ? detectCustomerRisk(item.text)
+                  : [];
+              const piiMatches = customerRisks.filter(
+                (risk) => risk.type === "pii",
+              );
+              const abuseMatches = customerRisks.filter(
+                (risk) => risk.type === "abuse",
+              );
+              const sensitive = maskSensitiveText(item.text, customerRisks);
+              const displayText = sensitive.masked;
+              const piiRanges = sensitiveRanges(item.text, piiMatches, "pii");
+              const abuseRanges = sensitiveRanges(
+                item.text,
+                abuseMatches,
+                "abuse",
+              );
+              const contractMasked =
+                piiMatches.length > 0 || abuseMatches.length > 0
+                  ? []
+                  : item.masked;
+              const bannerRisks = uniqueCustomerBanners(customerRisks).filter(
+                (risk) =>
+                  !dismissed.has(
+                    `${item.segment_id}:${risk.type}:${risk.startIndex}`,
+                  ),
+              );
+              const hideLegacyGuard = customerRisks.some(
+                (risk) => risk.type === "abuse" || risk.type === "distress",
+              );
+              // 실서버가 붙으면(`isCoreApiConfigured()`) 서버 판정(`applyCompliance`)만
+              // 쓴다 — 로컬 규칙(detectComplianceRisk)은 "불법체류" 한 단어만 잡는
+              // 자리표시자라 실제 위반 문장을 못 잡는다(`w6-compliance-alert-ui`).
+              // mock 모드는 서버가 이 신호를 보내지 않으므로 그대로 자리표시자를 쓴다.
+              const complianceWarnings: LineCompliance[] =
+                item.speaker === "agent" && !dismissed.has(item.segment_id)
+                  ? isCoreApiConfigured()
+                    ? complianceFromFindings(
+                        complianceFindings[item.segment_id] ?? [],
+                      )
+                    : (() => {
+                        const risk = detectComplianceRisk(item.text);
+                        return risk === null
+                          ? []
+                          : [{ key: risk.detectedPhrase, ...risk }];
+                      })()
+                  : [];
+              // 검사가 돌지 못한 상담원 발화 — 위반 경고가 없다고 「통과」로 보이지 않게
+              // 따로 표시한다(`w6-compliance-alert-ui` 완료 조건 2). 실서버 전용·실시간 전용.
+              const complianceMissed =
+                item.speaker === "agent" &&
+                !isHistory &&
+                isCoreApiConfigured() &&
+                complianceWarnings.length === 0 &&
+                complianceUnavailable[item.segment_id] !== undefined;
+              const translationHits =
+                hitsBySegment.get(`${item.segment_id}::tr`) ?? [];
+              const ttsLang =
+                tts === undefined
+                  ? null
+                  : (targetLanguage ?? targetLanguageFromCode(tts.target_lang));
+              const lineLang =
+                translation === undefined
+                  ? null
+                  : (targetLanguageFromCode(translation.original_lang) ??
+                    targetLanguage);
+              const activeHit =
+                activeMatch !== null &&
+                activeMatch.segmentId === item.segment_id
+                  ? activeMatch.range
+                  : null;
+              const activeTranslationHit =
+                activeMatch !== null &&
+                activeMatch.segmentId === `${item.segment_id}::tr`
+                  ? activeMatch.range
+                  : null;
+              return (
+                <li
+                  key={item.segment_id}
+                  ref={(node) => {
+                    if (node === null) {
+                      itemRefs.current.delete(item.segment_id);
+                    } else {
+                      itemRefs.current.set(item.segment_id, node);
+                    }
+                  }}
+                  className={`utterance ${item.speaker}${item.is_final ? "" : " interim"}`}
+                >
+                  <span className="bar" aria-hidden="true" />
+                  <div className="utterance-body">
+                    <div className="utterance-meta">
+                      <span className="speaker-cluster">
+                        <span className="speaker">
+                          {item.speaker === "customer" ? "고객" : "상담원"}
+                        </span>
+                        {item.speaker === "agent" && tts !== undefined ? (
+                          <span className="tts-sent">
+                            <TtsIcon />
+                            {ttsLang !== null ? (
+                              <LanguageBadge lang={ttsLang} />
+                            ) : (
+                              tts.target_lang.toUpperCase()
+                            )}
+                            {tts.status === "sent" ? "전송됨" : "대기"}
+                          </span>
+                        ) : null}
+                      </span>
+                      {!isHistory || item.utterance_end_ms > 0 ? (
+                        <time
+                          className="ts"
+                          dateTime={`+${item.utterance_end_ms}ms`}
+                        >
+                          {formatOffsetMs(item.utterance_end_ms)}
+                        </time>
+                      ) : null}
+                    </div>
+                    <div className="utterance-line">
+                      {lineLang !== null ? (
+                        <LanguageBadge lang={lineLang} />
+                      ) : null}
+                      {accentHints[item.segment_id] === true &&
+                      translation === undefined ? (
+                        <span className="accent-badge">억양 인식</span>
+                      ) : null}
+                      <div
+                        className={`utterance-bubble${piiMatches.length > 0 ? " has-pii-lock" : ""}${abuseMatches.length > 0 ? " has-abuse-lock" : ""}`}
+                      >
+                        {abuseMatches.length > 0 ? (
+                          <span
+                            className="abuse-lock"
+                            title="부적절한 표현이 마스킹되었습니다"
+                            aria-label="부적절한 표현이 마스킹되었습니다"
+                          >
+                            <AbuseMaskIcon />
+                          </span>
+                        ) : null}
+                        {piiMatches.length > 0 ? (
+                          <span
+                            className="pii-lock"
+                            title="저장할 때 가려지는 부분입니다"
+                            aria-label="저장할 때 가려지는 부분입니다"
+                          >
+                            <LockIcon />
+                          </span>
+                        ) : null}
+                        <p className="utterance-text">
+                          <MaskedText
+                            text={displayText}
+                            masked={contractMasked}
+                            piiRanges={piiRanges}
+                            abuseRanges={abuseRanges}
+                            hits={hits}
+                            activeHit={activeHit}
+                          />
+                        </p>
+                      </div>
+                      {/* 이 줄에 개인정보 구간이 있다는 정적 표시다. 2026-10-08 `decisions/326` 으로
+                          **화면은 원문**이 되었으므로 「마스킹된 줄」이 아니라 「저장할 때 가려질 줄」이다 —
+                          옛 「⚠ 경고」는 상담원 위반 경고와 같은 빨간 배지라, 고객이 번호를 불렀을 뿐인
+                          줄에 붙어 「고객이 잘못했다」로 읽혔다(시연 영상 검토 2026-10-02).
+                          원문 열람 토글은 SEC-1과 모순이라 걷었다(`decisions/408`). */}
+                      {hasAlert ? (
+                        <span
+                          className="alert-pill is-mask"
+                          title="저장·전송할 때 이 부분은 가려집니다"
+                        >
+                          저장 시 가림
+                        </span>
+                      ) : null}
+                    </div>
+                    {!hideLegacyGuard
+                      ? guards
+                          .filter((g) => !dismissed.has(`${item.segment_id}:guard:${g.category}`))
+                          .map((g) => {
+                            const copy = CALL_GUARD_COPY[g.category];
+                            return (
+                              <div
+                                key={g.category}
+                                role="alert"
+                                className={`callguard-row${isCallGuardDistress(g) ? " is-distress" : ""}`}
+                                data-callguard-category={g.category}
+                              >
+                                <span className="callguard-pill">{copy.pill}</span>
+                                {g.phrase !== undefined ? (
+                                  <CallGuardPhrase phrase={g.phrase} />
+                                ) : null}
+                                <span className="callguard-hint">
+                                  {copy.hint}
+                                  <span className="callguard-source">{` (${copy.source})`}</span>
+                                </span>
+                                {/* 닫기 — QA 2회차 Q-45: 컴플라이언스 경고는 닫히는데 콜 가드는 못 닫았다 */}
+                                <button
+                                  type="button"
+                                  className="compliance-dismiss callguard-dismiss"
+                                  aria-label="콜 가드 알림 닫기"
+                                  onClick={() => {
+                                    setDismissed((current) => {
+                                      const next = new Set(current);
+                                      next.add(`${item.segment_id}:guard:${g.category}`);
+                                      return next;
+                                    });
+                                  }}
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            );
+                          })
+                      : null}
+                    {translation !== undefined ? (
+                      <p className="utterance-translation">
+                        <MaskedText
+                          text={translation.translated_text}
+                          masked={[]}
+                          hits={translationHits}
+                          activeHit={activeTranslationHit}
+                        />
+                      </p>
+                    ) : null}
+                    {bannerRisks.map((risk) => {
+                      const key = `${item.segment_id}:${risk.type}:${risk.startIndex}`;
+                      return (
+                        <CustomerRiskBanner
+                          key={key}
+                          type={risk.type}
+                          matchedText={risk.matchedText}
+                          guidance={CUSTOMER_GUIDANCE[risk.type]}
+                          supervisorNotified={notifiedKeys.has(key)}
+                          emphasized={risk.matchedText.includes("가만 안 둘")}
+                          onDismiss={() => {
+                            setDismissed((current) => {
+                              const next = new Set(current);
+                              next.add(key);
+                              return next;
+                            });
+                          }}
+                        />
+                      );
+                    })}
+                    {complianceWarnings.map((warning) => (
+                      <ComplianceWarningBanner
+                        key={warning.key}
+                        label={complianceLabel(warning.suggestedPhrase)}
+                        detectedPhrase={warning.detectedPhrase}
+                        suggestedPhrase={warning.suggestedPhrase}
+                        onDismiss={() => {
+                          setDismissed((current) => {
+                            const next = new Set(current);
+                            next.add(item.segment_id);
+                            return next;
+                          });
+                        }}
+                      />
+                    ))}
+                    {complianceMissed ? <ComplianceUnavailableNotice /> : null}
+                    {!isHistory && noDocsSegments[item.segment_id] === true ? (
+                      <NoDocsNote />
+                    ) : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </div>
+
+      <ManualSearchBar onSearch={onManualSearch} />
+
+      {showJump && !isHistory ? (
+        <button type="button" className="jump-latest" onClick={jumpToLatest}>
+          <svg
+            className="jump-latest-icon"
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.6"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 5v14M6 13l6 6 6-6" />
+          </svg>
+          최신 대화로 이동
+        </button>
+      ) : null}
+    </section>
+  );
+}
+
+function AbuseMaskIcon(): ReactElement {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3 5 6v6c0 5 3.2 7.8 7 9 3.8-1.2 7-4 7-9V6l-7-3Z" />
+      <path d="M9 12h6" />
+    </svg>
+  );
+}
+
+function LockIcon(): ReactElement {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="5" y="11" width="14" height="10" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+    </svg>
+  );
+}
+
+function TtsIcon(): ReactElement {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M2.5 6.2v3.6h2.2L8 13.2V2.8L4.7 6.2H2.5Z"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M10.2 5.6a3 3 0 0 1 0 4.8"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+/**
+ * B-6 — 이 발화로 검색은 했지만 관련 문서를 찾지 못했다. 패널 전체 빈 문구만으로는
+ * 어느 발화에서 못 찾았는지 안 보인다. 「없다」가 아니라 「못 찾았다」로만 쓴다.
+ */
+export function NoDocsNote(): ReactElement {
+  return <p className="no-docs-note">관련 문서 없음 — 이 발화로는 찾지 못했습니다</p>;
+}
+
+/**
+ * C-6 — 서버가 잡은 표현(마스킹된 자막에서 잘라 온 것). 어느 말 때문에 경고가 떴는지
+ * 상담원이 보게 한다. 점수·위험도 없이 표현만 보인다(부록 A-1).
+ */
+export function CallGuardPhrase({ phrase }: { phrase: string }): ReactElement {
+  return <span className="callguard-phrase">{`「${phrase}」`}</span>;
+}

@@ -1,0 +1,81 @@
+---
+layout: doc
+title: 8. 8주 마일스톤
+permalink: /docs/08/
+---
+
+{% include pivot-201.html note="**이 페이지에서 바뀐 것 (2026-09-28 정정)**: ① 1주차의 **도메인 4종 지식베이스·골든셋**은 다산 단일로 다시 만들었고 **B-0 도메인 라우팅은 폐기**됐다(`decisions/201`). ② 4주차 **「RRF 병합」은 채택하지 않았다** — 운영은 KoE5 dense 우선, 결과가 없으면 BM25 폴백이고 리랭커는 운영에서 뺐다(`decisions/206`·`124`). ③ 6주차 「HF Transformers 카드 생성」 — **모델은 학습하지 않는다**(`decisions/210`). 운영 `/health`(server 0.1.42)에 `generation` 스포크가 없어 카드는 근거 발췌로 폴백한다. ④ 7주차 체크포인트를 기다리지 않고 **F-2 는 구현 완결로 갔다**(`decisions/125`). ⑤ 8주차 「G-2 또는 H·I 택1」 — **착수하지 않는다.** 09-30 판정 결과와 무관한 범위 관리 판단이다(`decisions/132`)." %}
+
+애자일 스크럼 방식으로 운영합니다. **1주 = 1스프린트, 총 8스프린트.**
+
+<style>
+  .kanban{ display:grid; grid-template-columns:repeat(4,1fr); align-items:start; gap:0.9rem; margin:1.25rem 0 0.5rem; }
+  .kanban .col{ background:#10151F; border:1px solid rgba(223,228,238,.12); border-radius:8px; padding:0.75rem; }
+  .kanban .col h4{ margin:0 0 0.75rem; font-family:'IBM Plex Mono',monospace; font-size:0.72rem; letter-spacing:.05em; text-transform:uppercase; color:#79839B; font-weight:600; white-space:nowrap; }
+  .kanban .card{ background:#080B12; border:1px solid rgba(223,228,238,.12); border-radius:6px; padding:0.6rem 0.7rem; margin-bottom:0.6rem; font-size:0.85rem; line-height:1.5; color:#DFE4EE; }
+  .kanban .card .role{ display:inline-block; font-family:'IBM Plex Mono',monospace; font-size:0.65rem; letter-spacing:.04em; font-weight:600; padding:0.15rem 0.5rem; border-radius:999px; margin-bottom:0.35rem; white-space:nowrap; border:1px solid currentColor; }
+  .role-infra{ background:rgba(110,143,214,.12); color:#8FA8E8; }
+  .role-ai{ background:rgba(245,166,35,.12); color:#F5A623; }
+  .role-app{ background:rgba(255,230,168,.10); color:#FFE6A8; }
+  @media (max-width:640px){ .kanban{ grid-template-columns:1fr 1fr; } }
+</style>
+
+### 1주차 보드 (2026-08-20 ~ 08-26) — 기반 + 전제 확인
+
+> **담당자별 진행 상황은 → [칸반 보드](/kanban/)**
+>
+> 이 페이지에 보드를 직접 그려두면 세 사람이 같은 파일을 동시에 고쳐 병합 충돌이 난다.
+> 티켓은 `jekyll/_backlogs/` 에 **1건당 1파일**로 두고 `/kanban/` 이 모아서 렌더링한다.
+
+**일자별 진행 내역은 → [Sprint 1 진행 로그](/sprints/01/)**
+
+### 1주차 체크리스트
+
+- [x] AI Hub 데이터 신청 (**최우선**) — 승인·다운로드 완료. 「민원(콜센터) 질의-응답」 데이터셋([w1-aihub-apply](/backlog/w1-aihub-apply/))
+- [x] **[5.6절](/docs/05/) V1~V4 확인** (채널 구성 / GPU / STT 숫자 출력 / 부분 결과 지연) — 4건 모두 실측([V1](/backlog/w1-v1-channel/) · [V2](/backlog/w1-v2-gpu/) · [V3·V4](/backlog/w1-v3-v4-stt/))
+- [x] 인터페이스 스키마 확정 (전사·카드·종결 3종) — **v2** 로 확정, `segment_id` 추가([w1-interface-contract](/backlog/w1-interface-contract/), `_project/decisions/003`)
+- [x] 지식베이스 문서 수집 + 청킹 + **ID 부여** — 도메인 4종 × terms/manual/policy, 접두어 ID(`FIN-`/`DASAN-`/`SHOP-`/`HLT-`)([w1-knowledge-base](/backlog/w1-knowledge-base/))
+- [x] 골든셋 **10개** + 스펙 확정(발화 종료 시각, 개인정보 패턴 포함) — 도메인 4종 기준으로 전면 재작성([w1-golden-set-10](/backlog/w1-golden-set-10/))
+- [x] 평가 하네스 골격(류준 설계) + CI 연결(정성윤) — 하네스 + CI 3종(테스트·구조 계약·사이트 빌드) 통과([w1-eval-harness](/backlog/w1-eval-harness/) · [w1-eval-ci](/backlog/w1-eval-ci/))
+
+**1주차 목표 6개 전부 달성.** 다만 아래 두 가지는 다음 주로 넘어간다.
+
+- **기준선 게이트는 아직 없다** — CI 는 테스트·구조 계약·링크만 본다. 기준선 미달 실패([6.2절](/docs/06/))는
+  측정값이 없는 상태에서 넣으면 무조건 실패하거나 가짜 기준선을 적게 되므로(절대 원칙 2) 2주차 베이스라인 이후로 미뤘다
+  → [w2-baseline-gate](/backlog/w2-baseline-gate/)
+- **도메인 라우팅은 방식만 정해졌다** — 자동 분류(B-0)로 결정(`_project/decisions/007`)했고 분류기 구현·학습은 미착수
+  → [w1-domain-routing](/backlog/w1-domain-routing/)
+
+### 8주 로드맵
+
+| 주차 | 목표 |
+|---|---|
+| **[1주차](/sprints/01/)** | 기반 + 전제 확인 (AI Hub 신청, V1~V4, 스키마 확정, 골든셋 10개) |
+| 2주차 | 베이스라인 — 가장 단순한 RAG(고정 청킹, BM25만), 골든셋 50개 → 잠정 베이스라인, STT 배치 연동 |
+| 3주차 | 실시간화 + 마스킹 — 스트리밍 STT+WebSocket, 화자 분리, 트리거 v1, React 자막, **C-5 마스킹**, 골든셋 150개 → 공식 기준선 |
+| 4주차 | 검색 품질 — nori 인덱스, dense_vector, RRF 병합, 청킹 전략 3종 비교 |
+| 5주차 | **오류 내성 실험 (핵심 주차)** — STT 오류 주입, 0~20% 구간별 성능 곡선, C-5 마스킹 재현율 곡선 |
+| 6주차 | 생성 + 컴플라이언스 — HF Transformers 카드 생성, "관련 문서 없음" 처리, 컴플라이언스 분류기, **코어 기준선 통과 확인** |
+| 7주차 | 운영 관점 + **F-2 체크포인트** — 레이턴시 측정, LRU 캐싱, 토큰 비용, 통화 후 요약, Docker |
+| 8주차 | 마감 — F-2 마무리/설계 문서, (여유 시) G-2 또는 H·I 택1, 후반 3일 발표·문서 전용 |
+| 마감 기간 | **10-15 ~ 10-27** — 새 기능 착수 없이 발표 · 최종 문서 · 시연 리허설 · 회고 · 최종 측정 확인 · 결함 수정만 (2026-09-21 추가) |
+
+> **주차 날짜와 마감 기간 (2026-09-21, 결정 기록 129).** 1주 1스프린트이고 1주차가 `08-20 ~ 08-26` 이라
+> **8주차는 10-08 ~ 10-14 에 끝난다.** 개발기간(10-27)까지 남는 13일은 위 「마감 기간」이다.
+> 확장 모듈 택1은 10-14 안에서만 하고, 자원 종료 정리는 10-27 뒤에 한다. 발표일이 확인되면 이 배정을 고친다.
+
+> **7주차 중반 체크포인트**: 코어 기준선 통과 + 태스크 궤도 정상 → **F-2 구현 진행**. 둘 중 하나라도 미달 → **F-2를 설계 문서로 전환** (시퀀스 다이어그램 + 요건 스키마 산출).
+
+### 성공 조건 — 재설정
+
+> **STT 오류 내성 실험([4.2절](/docs/04/)) + 검색 품질 개선 수치.** 이 두 가지가 나오면 프로젝트는 성공이다. **F-2는 달성 시 추가 성과로 본다.**
+
+이전 리비전은 성공 조건을 F-2에 걸었으나, F-2는 조건부 항목이므로 부적절하다. 폴백으로 가더라도 프로젝트가 실패로 읽히지 않도록 기준을 재설정한다.
+
+**범위 관리 규칙**: 6주차 종료 시점에 코어 기준선을 통과하지 못했다면 F·G·H·I를 착수하지 않는다. **C-5만 예외로 코어에 포함되므로 3주차에 반드시 들어간다.**
+
+**진행 방식:** 매 스프린트 시작일 스프린트 플래닝 → 스프린트 종료일 리뷰·회고 → 결과는 [진행상황](/progress/) 페이지에 기록.
+
+---
+
+[← 개발목차로 돌아가기](/toc/)

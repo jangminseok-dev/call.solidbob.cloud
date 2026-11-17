@@ -1,0 +1,73 @@
+name: Deploy Jekyll site to Pages
+
+# 지킬 사이트가 저장소 루트가 아니라 jekyll/ 하위에 있어
+# Pages 의 "Deploy from a branch"(루트 또는 /docs 만 지원)를 쓸 수 없다.
+# 그래서 Actions 로 빌드해 배포한다. → 미결 항목 OI-06
+#
+# ⚠ 이 워크플로가 동작하려면 저장소 설정이 필요하다 (solidbob02 계정에서):
+#    Settings → Pages → Build and deployment → Source: GitHub Actions
+#    설정 전에는 deploy 단계가 실패한다.
+
+# main 에 무엇이 머지되든 배포한다. PM·backend·ai·frontend 어느 브랜치에서 오든
+# (flutter 브랜치는 앱 개발 중단으로 ai 로 대체됨 — _project/decisions/005)
+# "머지 = 배포"로 규칙을 단순하게 유지한다. (경로 조건을 걸면 jekyll/ 밖만 바뀐 머지에서
+# 배포가 조용히 건너뛰어져 "왜 반영이 안 되지?"가 생긴다.)
+# 개인 사본 저장소에서는 자동 배포하지 않는다. 운영 배포는 팀 원본 저장소(SeongYuna/call.solidbob.cloud)에서 했다.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 배포는 한 번에 하나만. 진행 중인 배포를 취소하지 않는다.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 루비 설치 (Gemfile.lock 기준)
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: jekyll
+
+      - name: Pages 설정 로드
+        id: pages
+        uses: actions/configure-pages@v5
+
+      # ⚠ `--baseurl` 은 Pages 설정에서 자동으로 온다. 커스텀 도메인이 붙기 전에는
+      # `/call.solidbob.cloud`, 붙은 뒤에는 빈 문자열이다(`configure-pages` 가 page_url 의
+      # 경로 부분을 넘긴다). 사이트 안의 링크 405곳이 `/docs/09/` 같은 루트 절대경로라
+      # **baseurl 이 비어 있어야만 맞는다** — 그래서 커스텀 도메인이 곧 404 수정이다.
+      # 커스텀 도메인은 저장소 Settings → Pages 에서 정한다(Actions 배포는 `jekyll/CNAME`
+      # 파일을 읽지 않는다 — 그 파일은 표식·이관용이다). `_project/decisions/102`
+      - name: 지킬 빌드
+        run: bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}"
+        working-directory: jekyll
+        env:
+          JEKYLL_ENV: production
+
+      - name: 산출물 업로드
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: jekyll/_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Pages 배포
+        id: deployment
+        uses: actions/deploy-pages@v4

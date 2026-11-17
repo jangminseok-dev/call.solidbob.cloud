@@ -1,0 +1,110 @@
+_site
+.sass-cache
+.jekyll-cache
+.jekyll-metadata
+vendor
+.env
+.env.local
+.env.*.local
+# ⚠ `.env` 백업·사본 전부 (2026-09-14 추가). `.env` 한 줄만으로는 `.env.bak`·`.env.old`·
+#   `.env.20260914` 같은 사본이 **추적 대상이 된다** — 이 저장소는 공개라 커밋이 곧 발행이다.
+#   실제로 이 규칙을 넣기 직전에 `.env.bak-20260914` 가 추적 대상으로 잡히는 것을 확인했다.
+.env.*
+!.env.example
+
+# 원본/전처리 데이터 — 용량이 크고 AI Hub 등 재배포 금지 조항이 있어 커밋하지 않는다.
+# data/README.md만 예외로 추적한다.
+/data/raw/
+/data/processed/
+
+# --- 음성·통화 데이터 (CLAUDE.md §8 · 절대 원칙 7) --------------------------
+# ⚠ 이 저장소는 GitHub Pages 로 **공개 게시**된다. 커밋이 곧 발행이다.
+#    통화 오디오는 개인정보를 담고 있어 어떤 경로로도 커밋하지 않는다.
+#    2026-09-03 에 `resources/0001.wav` 가 무방비로 놓여 있는 것을 발견해 추가했다.
+/resources/
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# 모델 가중치 — 용량이 크고 HuggingFace에서 다시 받을 수 있어 커밋하지 않는다.
+/models/
+# 로컬 개발 인프라 오버라이드 (포트·비밀번호 등). SEC-2
+/infra/.env
+
+# --- Terraform (SEC-2) -------------------------------------------------------
+# ⚠ state 에는 RDS 비밀번호가 **평문으로** 들어간다. 백엔드를 원격으로 옮기기 전까지
+#    로컬에만 두고 절대 커밋하지 않는다. tfvars 도 마찬가지다 — 예시만 커밋한다.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+*.auto.tfvars
+terraform.tfvars
+!terraform.tfvars.example
+.terraformrc
+terraform.rc
+
+/.venv/
+/logs/
+
+# --- macOS ------------------------------------------------------------------
+# 팀원마다 브랜치가 달라도 폴더를 열 때마다 생기므로, 사람 수만큼 반복해서
+# 커밋에 섞여 들어올 수 있다.
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+
+# --- Python (services/core 등) ----------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node.js / React (services/call-mediator, apps/call — 예정) ---------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+.next/
+out/
+coverage/
+
+# Vercel CLI 프로젝트 링크(개인 계정 projectId/orgId) — 사람마다 다르고 비공개 계정
+# 정보라 공유하지 않는다. apps/call/.vercel 도 동일한 이유로 무시된다.
+.vercel
+
+# --- 에디터/IDE — 개인 설정이라 브랜치마다 달라 충돌만 일으킨다 ------------------
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- 자격증명 안전망 — 실수로 레포 안에 떨궈도 커밋되지 않게 ---------------------
+*.pem
+*.key
+*-key.json
+service-account*.json
+credentials.json
+
+# --- 기타 -------------------------------------------------------------------
+*.log
+*.tmp
+docker-compose.override.yml
+
+# Claude Code 개인 설정 — 팀 공유 대상이 아니다 (.claude/settings.json 은 공유)
+.claude/settings.local.json
+
+# import-linter 캐시 (fastapi/)
+.import_linter_cache/

@@ -1,0 +1,255 @@
+{
+  "version": "v1",
+  "created": "2026-08-26",
+  "size": 13,
+  "note": "2주차 골든셋. 2026-08-28 다산콜센터 단일 도메인 전환(`_project/decisions/201`)으로 50건 → 13건이 됐다. 빠진 것: 금융보험·쇼핑·질병관리본부 항목 전부, 그리고 그에 딸린 F-2 케이스 전부(다산은 종결 유형이 없어 F-2 채점 케이스가 0건이다). 더한 것: 실제 AI Hub 다산 발화에 근거한 GS-101·GS-102 — GS-102('대리 신청시 필요한 서류가 있나요')가 새 메인 기능(B 필요서류 제시)의 대표 케이스다. ⚠ 13건은 지표를 신뢰하기에 너무 적다. Recall@5·MRR 은 다산 기준으로 재측정해야 하며 이전 수치(0.857/0.702, 4개 도메인 14건 기준)는 무효다.",
+  "items": [
+    {
+      "id": "GS-002",
+      "module": "B",
+      "domain": "dasan",
+      "customer_utterance": "여기 정류장에 저상버스가 언제 오는지 실시간으로 알 수 있는 방법이 있나요",
+      "utterance_end_ms": 2500,
+      "expected_doc_ids": [
+        "DASAN-TERM-2.1"
+      ],
+      "distractor_doc_ids": [
+        "DASAN-TERM-2.2",
+        "DASAN-TERM-3.1"
+      ],
+      "compliance_violation": null,
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "대중교통 실시간 배차 안내 → 안내지침 2.1조. 교통약자 이동지원(2.2조)과 혼동하지 않는지 확인."
+    },
+    {
+      "id": "GS-007",
+      "module": "C-5",
+      "domain": "dasan",
+      "speaker": "customer",
+      "customer_utterance": "처리 결과 다시 연락 주셔야 하는데 제 번호는 01012345678이에요",
+      "pii_patterns": [
+        {
+          "pattern": "P4",
+          "raw_span": "01012345678",
+          "masked_expected": true
+        }
+      ],
+      "expected_doc_ids": [],
+      "distractor_doc_ids": [],
+      "compliance_violation": null,
+      "f2_case": null,
+      "notes": "구분자 없이 붙어있는 형태 — [기능 명세 2.4절] STT 주 실패 모드(구분자 부재) 대응 검증용 핵심 케이스."
+    },
+    {
+      "id": "GS-014",
+      "module": "B",
+      "domain": "dasan",
+      "customer_utterance": "어머니가 거동이 불편하신데 교통약자 이동지원은 어떻게 신청하나요",
+      "utterance_end_ms": 2600,
+      "expected_doc_ids": [
+        "DASAN-TERM-2.2"
+      ],
+      "distractor_doc_ids": [
+        "DASAN-TERM-2.1",
+        "DASAN-TERM-3.1"
+      ],
+      "compliance_violation": null,
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "교통약자 이동지원 신청 문의 → 안내지침 2.2조."
+    },
+    {
+      "id": "GS-015",
+      "module": "B",
+      "domain": "dasan",
+      "customer_utterance": "이번 달 하수도 요금이 갑자기 많이 나왔는데 어떻게 계산되는 건가요",
+      "utterance_end_ms": 2300,
+      "expected_doc_ids": [
+        "DASAN-TERM-3.1"
+      ],
+      "distractor_doc_ids": [
+        "DASAN-TERM-3.2",
+        "DASAN-TERM-2.1"
+      ],
+      "compliance_violation": null,
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "하수도 사용료 산정 기준 문의 → 안내지침 3.1조."
+    },
+    {
+      "id": "GS-016",
+      "module": "B",
+      "domain": "dasan",
+      "customer_utterance": "제가 직접 못 가서 그런데 가족이 대신 등본을 발급받을 수 있나요",
+      "utterance_end_ms": 2200,
+      "expected_doc_ids": [
+        "DASAN-TERM-4.1"
+      ],
+      "distractor_doc_ids": [
+        "DASAN-TERM-4.2",
+        "DASAN-TERM-1.2"
+      ],
+      "compliance_violation": null,
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "증명서 대리 발급 요건 문의 → 안내지침 4.1조."
+    },
+    {
+      "id": "GS-024",
+      "module": "C-2",
+      "domain": "dasan",
+      "speaker": "agent",
+      "agent_utterance": "민원 접수하시려면 주민등록번호 뒷자리까지 전부 불러주셔야 해요",
+      "compliance_violation": {
+        "type": "C-2",
+        "phrase": "주민등록번호 뒷자리까지 전부 불러주셔야",
+        "expected_alternative_source": "DASAN-MANUAL-1.4"
+      },
+      "expected_doc_ids": [],
+      "distractor_doc_ids": [],
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "민원 접수에 불필요한 주민등록번호 전체 요구 — 응대매뉴얼 1.2 위반."
+    },
+    {
+      "id": "GS-028",
+      "module": "C-3",
+      "domain": "dasan",
+      "speaker": "agent",
+      "agent_utterance": "네 알겠습니다 대리 신청으로 처리해드릴게요",
+      "compliance_violation": {
+        "type": "C-3",
+        "phrase": "대리 신청으로 처리해드릴게요",
+        "expected_alternative_source": "DASAN-MANUAL-1.4"
+      },
+      "expected_doc_ids": [],
+      "distractor_doc_ids": [],
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "위임장 필요 여부 안내 없이 대리 신청 처리 — 응대매뉴얼 3.1 위반."
+    },
+    {
+      "id": "GS-033",
+      "module": "C-5",
+      "domain": "dasan",
+      "speaker": "customer",
+      "customer_utterance": "저희 집 주소가 서울시 강남구 테헤란로 123번지 456호예요",
+      "pii_patterns": [
+        {
+          "pattern": "P7",
+          "raw_span": "서울시 강남구 테헤란로 123번지 456호",
+          "masked_expected": true
+        }
+      ],
+      "expected_doc_ids": [],
+      "distractor_doc_ids": [],
+      "compliance_violation": null,
+      "f2_case": null,
+      "notes": "상세주소(P7, NER) — 시설 민원 접수 시 주소 발화 케이스."
+    },
+    {
+      "id": "GS-037",
+      "module": "C-5",
+      "domain": "dasan",
+      "speaker": "customer",
+      "customer_utterance": "제 이름 박서연이고 번호는 010-2345-6789예요 다시 연락 주세요",
+      "pii_patterns": [
+        {
+          "pattern": "P6",
+          "raw_span": "박서연",
+          "masked_expected": true
+        },
+        {
+          "pattern": "P4",
+          "raw_span": "010-2345-6789",
+          "masked_expected": true
+        }
+      ],
+      "expected_doc_ids": [],
+      "distractor_doc_ids": [],
+      "compliance_violation": null,
+      "f2_case": null,
+      "notes": "인명(P6)+구분자 있는 휴대전화(P4) 동시 등장 — 한 발화에 복수 패턴."
+    },
+    {
+      "id": "GS-051",
+      "module": "C-5",
+      "domain": "dasan",
+      "speaker": "customer",
+      "customer_utterance": "이름을 바꾸고 싶어요 어떻게 하나요",
+      "utterance_end_ms": 3100,
+      "trigger_examples": [],
+      "expected_doc_ids": [],
+      "distractor_doc_ids": [],
+      "compliance_violation": null,
+      "pii_patterns": [
+        {
+          "pattern": "P6",
+          "raw_span": "",
+          "masked_expected": false
+        }
+      ],
+      "f2_case": null,
+      "notes": "음성 케이스(P6) — 목적격 '이름을 X' 는 이름을 밝히는 말이 아니라 대상으로 하는 말이다. 2026-08-27 구현 중 '바꾸고'를 이름으로 잡던 실제 버그."
+    },
+    {
+      "id": "GS-056",
+      "module": "C-5",
+      "domain": "dasan",
+      "speaker": "customer",
+      "customer_utterance": "그 김민준 씨가 어제 신고한 건 확인 부탁드려요",
+      "utterance_end_ms": 3100,
+      "trigger_examples": [],
+      "expected_doc_ids": [],
+      "distractor_doc_ids": [],
+      "compliance_violation": null,
+      "pii_patterns": [
+        {
+          "pattern": "P6",
+          "raw_span": "",
+          "masked_expected": false
+        }
+      ],
+      "f2_case": null,
+      "notes": "⚠ 규칙의 한계를 고정하는 음성 케이스(P6) — 문맥 없는 인명은 규칙으로 못 잡는다. NER 이 붙으면 이 항목을 masked_expected: true 로 뒤집는다."
+    },
+    {
+      "id": "GS-101",
+      "module": "B",
+      "domain": "dasan",
+      "customer_utterance": "화장실 배관 쪽에서 물이 새는 거 같은데 이거 어디다 접수하면 돼요",
+      "utterance_end_ms": 2700,
+      "expected_doc_ids": [
+        "DASAN-TERM-3.2"
+      ],
+      "distractor_doc_ids": [
+        "DASAN-TERM-3.1"
+      ],
+      "compliance_violation": null,
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "AI Hub 다산 실제 발화(고객의도: 누수). 시설 고장·민원 접수(3.2조) ↔ 하수도 요금(3.1조) 혼동 확인. 2026-08-28 decisions/201 전환 시 추가. ⚠ 2026-09-22: AI Hub 원문을 같은 의도의 새 문장으로 바꿔 썼다(`decisions/212`). 앞의 「실제 발화」 서술은 교체 전 기록이다."
+    },
+    {
+      "id": "GS-102",
+      "module": "B",
+      "domain": "dasan",
+      "customer_utterance": "다른 사람이 대신 신청하면 뭘 챙겨 가야 되나요",
+      "utterance_end_ms": 1900,
+      "expected_doc_ids": [
+        "DASAN-MANUAL-3.1",
+        "DASAN-TERM-4.1"
+      ],
+      "distractor_doc_ids": [
+        "DASAN-MANUAL-1.2"
+      ],
+      "compliance_violation": null,
+      "pii_patterns": [],
+      "f2_case": null,
+      "notes": "AI Hub 다산 실제 발화(고객의도: 재난지원금). **새 메인 기능(필요서류 자동 제시)의 대표 케이스.** 정답이 둘인 이유: 대리 신청 확인 절차(MANUAL-3.1)와 증명서 발급 필요서류(TERM-4.1)를 함께 띄워야 고객이 헛걸음하지 않는다 — 재현율 우선. 2026-08-28 추가. ⚠ 2026-09-22: AI Hub 원문을 같은 의도의 새 문장으로 바꿔 썼다(`decisions/212`). 앞의 「실제 발화」 서술은 교체 전 기록이다."
+    }
+  ],
+  "note_2026_08_28": "decisions/201 — 다산콜센터 단일 도메인 전환. 56건 중 다산 11건만 남기고 AI Hub 다산 실제 발화 2건(GS-101 시설고장 · GS-102 필요서류)을 더해 13건. ⚠ 이 크기로는 어떤 지표도 의미 있게 측정되지 않는다 — 3주차 150건 확장을 다산 기준으로 다시 잡는다.",
+  "note_2026_09_22": "2026-09-22 — `_project/decisions/212`: 이 판은 대체된 옛 판이지만 공개 저장소에 있으므로 GS-101·GS-102 의 AI Hub 원문 발화를 `v1-150.json` 과 같은 새 문장으로 바꿨다. 라벨은 그대로다. 원문은 git 이력에 남아 있다."
+}

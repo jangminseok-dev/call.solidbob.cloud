@@ -1,0 +1,285 @@
+// Requirement: A-1, A-4
+/** 구글 없이 교대 로직만 본다 — 스트림 가짜를 공장에 꽂는다. */
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { GoogleSttEngine, rmsOf, type EndpointOptions, type RecognizeStream } from "../src/adapters/google_stt.ts";
+import type { SttResult } from "../src/app/ports.ts";
+import { silence } from "./fakes.ts";
+
+class FakeRecognizeStream extends EventEmitter implements RecognizeStream {
+  bytes = 0;
+  ended = false;
+
+  write(chunk: Buffer): boolean {
+    this.bytes += chunk.byteLength;
+    return true;
+  }
+
+  end(): void {
+    this.ended = true;
+  }
+
+  result(text: string, isFinal: boolean, endSeconds: number): void {
+    this.emit("data", {
+      results: [
+        {
+          isFinal,
+          alternatives: [{ transcript: text }],
+          resultEndTime: { seconds: String(Math.floor(endSeconds)), nanos: Math.round((endSeconds % 1) * 1e9) },
+        },
+      ],
+    });
+  }
+
+  close(): void {
+    this.emit("end");
+  }
+}
+
+function setup(rotateAfterMs: number, hardLimitMs: number, endpoint: EndpointOptions | null = null, diarize = false) {
+  const streams: FakeRecognizeStream[] = [];
+  const engine = new GoogleSttEngine(
+    () => {
+      const stream = new FakeRecognizeStream();
+      streams.push(stream);
+      return stream;
+    },
+    { rotateAfterMs, hardLimitMs, endpoint },
+  );
+  const results: SttResult[] = [];
+  const fatals: string[] = [];
+  let ended = false;
+  const stt = engine.open(
+    16000,
+    {
+      onResult: (result) => results.push(result),
+      onFatal: (message) => fatals.push(message),
+      onEnd: () => {
+        ended = true;
+      },
+    },
+    { diarize },
+  );
+  return { streams, results, fatals, stt, isEnded: () => ended };
+}
+
+test("첫 오디오가 올 때 스트림을 연다", () => {
+  const { streams, stt } = setup(60_000, 120_000);
+  assert.equal(streams.length, 0);
+  stt.write(silence(0.1));
+  assert.equal(streams.length, 1);
+});
+
+test("rotateAfterMs 를 넘긴 뒤 final 이 오면 새 스트림으로 갈아타고, 시각을 이어 붙인다", () => {
+  const { streams, results, stt } = setup(2_000, 10_000);
+  stt.write(silence(3)); // 3초 — 교대 기준(2초) 넘김
+  streams[0]!.result("첫 문장", true, 2.5);
+  assert.equal(streams[0]!.ended, true, "final 뒤 옛 스트림을 닫지 않았다");
+
+  stt.write(silence(1));
+  assert.equal(streams.length, 2);
+  streams[1]!.result("둘째 문장", true, 0.8);
+  assert.equal(results[1]?.audioEndMs, 3_000 + 800, "새 스트림 결과 시각에 앞서 보낸 3초를 더해야 한다");
+});
+
+test("hardLimitMs 를 넘기면 final 을 기다리지 않고 갈아탄다", () => {
+  const { streams, stt } = setup(60_000, 2_000);
+  stt.write(silence(2));
+  stt.write(silence(0.5));
+  assert.equal(streams.length, 2);
+  assert.equal(streams[0]!.ended, true);
+});
+
+test("옛 스트림이 교대 뒤에 보낸 결과는 옛 기준 시각으로 붙는다", () => {
+  const { streams, results, stt } = setup(60_000, 2_000);
+  stt.write(silence(2));
+  stt.write(silence(1)); // 교대 — 두 번째 스트림 base = 2초
+  streams[0]!.result("끝나가던 말", true, 1.9);
+  assert.equal(results[0]?.audioEndMs, 1_900);
+});
+
+test("응답 하나의 interim 조각들은 이어 붙여 한 결과로 낸다 (2026-09-11 실측 모양)", () => {
+  const { streams, results, stt } = setup(600_000, 600_000);
+  stt.write(silence(1));
+  streams[0]!.emit("data", {
+    results: [
+      { isFinal: false, alternatives: [{ transcript: "로미 기프트콘" }], resultEndTime: { seconds: "1", nanos: 0 } },
+      { isFinal: false, alternatives: [{ transcript: " 쓰고 다른" }], resultEndTime: { seconds: "1", nanos: 500_000_000 } },
+    ],
+  });
+  assert.equal(results.length, 1, "조각마다 따로 내면 같은 번호로 서로 덮어쓴다");
+  assert.equal(results[0]?.text, "로미 기프트콘 쓰고 다른");
+  assert.equal(results[0]?.audioEndMs, 1_500);
+});
+
+test("final 과 다음 발화의 interim 이 한 응답에 오면 둘로 나눈다", () => {
+  const { streams, results, stt } = setup(600_000, 600_000);
+  stt.write(silence(1));
+  streams[0]!.emit("data", {
+    results: [
+      { isFinal: true, alternatives: [{ transcript: "주문할게요" }], resultEndTime: { seconds: "2" } },
+      { isFinal: false, alternatives: [{ transcript: "그리고" }], resultEndTime: { seconds: "3" } },
+    ],
+  });
+  assert.deepEqual(
+    results.map((r) => [r.text, r.isFinal]),
+    [
+      ["주문할게요", true],
+      ["그리고", false],
+    ],
+  );
+});
+
+test("25KB 넘는 오디오는 잘라서 보낸다", () => {
+  const { streams, stt } = setup(600_000, 600_000);
+  const big = silence(2); // 64KB
+  stt.write(big);
+  assert.equal(streams[0]!.bytes, big.byteLength);
+});
+
+test("OUT_OF_RANGE(11) — 시간 한도·무음 타임아웃은 채널을 닫지 않고 다음 오디오에서 다시 연다", () => {
+  const { streams, fatals, stt } = setup(600_000, 600_000);
+  stt.write(silence(0.5));
+  streams[0]!.emit("error", Object.assign(new Error("Audio Timeout"), { code: 11 }));
+  assert.equal(fatals.length, 0);
+  stt.write(silence(0.5));
+  assert.equal(streams.length, 2);
+});
+
+test("그 밖의 오류는 치명적이다 — 코드만 알린다", () => {
+  const { streams, fatals, stt } = setup(600_000, 600_000);
+  stt.write(silence(0.5));
+  streams[0]!.emit("error", Object.assign(new Error("PERMISSION_DENIED: 원문 같은 긴 설명"), { code: 7 }));
+  assert.deepEqual(fatals, ["구글 STT 스트림 오류 code=7"]);
+});
+
+test("end() 뒤 남은 스트림이 다 닫히면 onEnd", () => {
+  const { streams, stt, isEnded } = setup(600_000, 600_000);
+  stt.write(silence(0.5));
+  stt.end();
+  assert.equal(isEnded(), false, "결과가 남았을 수 있다");
+  streams[0]!.close();
+  assert.equal(isEnded(), true);
+});
+
+test("오디오 없이 end() 하면 곧바로 onEnd", () => {
+  const { stt, isEnded } = setup(600_000, 600_000);
+  stt.end();
+  assert.equal(isEnded(), true);
+});
+
+test("화자 분리 — 공장에 diarize 를 넘기고, final 을 화자 구간마다 라벨을 붙여 나눈다", () => {
+  const flags: boolean[] = [];
+  const streams: FakeRecognizeStream[] = [];
+  const engine = new GoogleSttEngine((_rate, diarize) => {
+    flags.push(diarize);
+    const stream = new FakeRecognizeStream();
+    streams.push(stream);
+    return stream;
+  });
+  const results: SttResult[] = [];
+  const stt = engine.open(
+    16000,
+    { onResult: (result) => results.push(result), onFatal: () => {}, onEnd: () => {} },
+    { diarize: true },
+  );
+  stt.write(silence(0.1));
+  const word = (text: string, end: number, tag: number) => ({ word: text, endTime: { seconds: String(Math.floor(end)), nanos: Math.round((end % 1) * 1e9) }, speakerTag: tag });
+  const final = (words: unknown[]) =>
+    streams[0]!.emit("data", { results: [{ isFinal: true, alternatives: [{ transcript: "무시", words }] }] });
+
+  streams[0]!.result("네 다산", false, 0.5); // interim — 라벨 없이 그대로
+  final([word("네", 0.4, 1), word("다산콜센터입니다", 1.2, 1), word("여권", 2.1, 2)]);
+  // 구글은 다음 응답에 처음부터의 단어를 다시 싣는다 — 새 단어만 나가야 한다
+  final([word("네", 0.4, 1), word("다산콜센터입니다", 1.2, 1), word("여권", 2.1, 2), word("재발급이요", 2.6, 2)]);
+
+  assert.deepEqual(flags, [true]);
+  assert.deepEqual(
+    results.map((r) => [r.text, r.isFinal, r.speakerLabel, r.audioEndMs]),
+    [
+      ["네 다산", false, undefined, 500],
+      ["네 다산콜센터입니다", true, "1", 1200],
+      ["여권", true, "2", 2100],
+      ["재발급이요", true, "2", 2600],
+    ],
+  );
+});
+
+test("화자 분리를 안 켜면 설정·결과가 지금과 같다 (V4 측정 설정)", () => {
+  const flags: boolean[] = [];
+  const engine = new GoogleSttEngine((_rate, diarize) => {
+    flags.push(diarize);
+    return new FakeRecognizeStream();
+  });
+  const stt = engine.open(16000, { onResult: () => {}, onFatal: () => {}, onEnd: () => {} });
+  stt.write(tone(0.1)); // 기본 설정은 끝점 검출이 켜져 있어 무음으로는 스트림이 안 열린다(2026-10-01)
+  assert.deepEqual(flags, [false]);
+});
+
+// --- A-4 로컬 끝점 검출 (2026-10-01) — 구글 기본 모델은 final 을 스트림 끝에만 줬다(운영 실측) ---
+
+/** 말소리 흉내 — 진폭 3,000 의 사각파(RMS 3,000). */
+function tone(seconds: number, sampleRate = 16000): Buffer {
+  const n = Math.round(seconds * sampleRate);
+  const out = Buffer.alloc(n * 2);
+  for (let i = 0; i < n; i += 1) {
+    out.writeInt16LE(i % 40 < 20 ? 3000 : -3000, i * 2);
+  }
+  return out;
+}
+
+const EP: EndpointOptions = { threshold: 400, silenceMs: 700, minSpeechMs: 250 };
+
+test("rmsOf — 무음은 0, 사각파는 진폭 그대로", () => {
+  assert.equal(rmsOf(silence(0.1)), 0);
+  assert.equal(Math.round(rmsOf(tone(0.1))), 3000);
+});
+
+test("끝점 — 말한 뒤 700ms 무음이면 스트림을 닫고(final 을 받으려고), 다음 소리에서 새 스트림을 연다. 시각은 이어진다", () => {
+  const { streams, results, stt } = setup(60_000, 120_000, EP);
+  stt.write(tone(0.5));
+  assert.equal(streams.length, 1);
+  stt.write(silence(0.8));
+  assert.equal(streams[0]!.ended, true, "700ms 무음 뒤 닫힌다");
+  stt.write(silence(0.5));
+  assert.equal(streams.length, 1, "무음은 새 스트림을 열지 않는다");
+  stt.write(tone(0.2));
+  assert.equal(streams.length, 2);
+  streams[1]!.result("두 번째", true, 0.1);
+  // 0.5 + 0.8 + 0.5 = 1,800ms 가 지난 뒤 열렸고, 그 스트림 기준 100ms 에 끝났다.
+  assert.equal(results.at(-1)?.audioEndMs, 1900);
+});
+
+test("끝점 — 앞머리 무음은 스트림을 열지 않고 시각만 흐른다", () => {
+  const { streams, results, stt } = setup(60_000, 120_000, EP);
+  stt.write(silence(1));
+  assert.equal(streams.length, 0);
+  stt.write(tone(0.1));
+  assert.equal(streams.length, 1);
+  streams[0]!.result("첫", true, 0.05);
+  assert.equal(results.at(-1)?.audioEndMs, 1050);
+});
+
+test("끝점 — minSpeechMs 미만의 짧은 소리 뒤 무음은 발화 끝이 아니다", () => {
+  const { streams, stt } = setup(60_000, 120_000, EP);
+  stt.write(tone(0.1));
+  stt.write(silence(1));
+  assert.equal(streams[0]!.ended, false);
+});
+
+test("끝점 — 화자 분리(diarize) 에서는 끝점 검출을 하지 않는다", () => {
+  const { streams, stt } = setup(60_000, 120_000, EP, true);
+  stt.write(tone(0.5));
+  stt.write(silence(1));
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0]!.ended, false);
+});
+
+test("끝점 — 옵션이 없으면(기존 동작) 무음도 그대로 보낸다", () => {
+  const { streams, stt } = setup(60_000, 120_000, null);
+  stt.write(silence(1));
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0]!.bytes, 32000);
+});
+

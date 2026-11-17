@@ -1,0 +1,72 @@
+/**
+ * ⚠ **mock 모드 전용이다.** 실서버(`isCoreApiConfigured()`)에서는 `TranscriptPanel` 이
+ * `customerRisks` 를 비워 두므로 이 함수들이 글자를 바꾸지 않는다 — 2026-10-08
+ * `decisions/326` 으로 **화면 자막은 원문**이고, 가리는 일은 서버가 저장 앞단에서 한다.
+ * 여기서 만드는 `is-pii`·`is-abuse` 구간은 「이미 가려진 자리」이고,
+ * 서버가 주는 `masked` 구간은 「저장할 때 가려질 자리」다 — 뜻이 다르다.
+ */
+import type { CustomerRiskMatch } from "./detectCustomerRisk";
+import type { CharRange } from "../text/highlight";
+
+function utf16ToCodeRange(
+  text: string,
+  start: number,
+  end: number,
+): CharRange {
+  const from = Array.from(text.slice(0, start)).length;
+  const width = Array.from(text.slice(start, end)).length;
+  return { start: from, end: from + width };
+}
+
+function maskPiiSlice(slice: string): string {
+  const dash = slice.indexOf("-");
+  if (dash === -1) {
+    return "•".repeat([...slice].length);
+  }
+  return `${slice.slice(0, dash + 1)}${"•".repeat([...slice.slice(dash + 1)].length)}`;
+}
+
+function isAbuseLetter(ch: string): boolean {
+  return /\p{L}|\p{N}/u.test(ch);
+}
+
+/** 글자만 * 로 바꾸고 공백·문장부호는 원위치 그대로 둔다. */
+function maskAbuseSlice(slice: string): string {
+  return [...slice].map((ch) => (isAbuseLetter(ch) ? "*" : ch)).join("");
+}
+
+export interface SensitiveMaskResult {
+  masked: string;
+}
+
+/**
+ * PII는 •, 욕설은 * 로 같은 길이를 유지해 구간이 어긋나지 않게 한다.
+ * 화면은 항상 마스킹본만 보여준다 — 원문 열람 토글은 SEC-1과 모순이라
+ * 걷었다(`decisions/408`, `w7-plaintext-reveal-sec1`).
+ */
+export function maskSensitiveText(
+  text: string,
+  matches: readonly CustomerRiskMatch[],
+): SensitiveMaskResult {
+  const hits = [...matches]
+    .filter((item) => item.type === "pii" || item.type === "abuse")
+    .sort((a, b) => b.startIndex - a.startIndex);
+  let next = text;
+  for (const hit of hits) {
+    const slice = next.slice(hit.startIndex, hit.endIndex);
+    const masked =
+      hit.type === "pii" ? maskPiiSlice(slice) : maskAbuseSlice(slice);
+    next = `${next.slice(0, hit.startIndex)}${masked}${next.slice(hit.endIndex)}`;
+  }
+  return { masked: next };
+}
+
+export function sensitiveRanges(
+  text: string,
+  matches: readonly CustomerRiskMatch[],
+  type: "pii" | "abuse",
+): CharRange[] {
+  return matches
+    .filter((item) => item.type === type)
+    .map((item) => utf16ToCodeRange(text, item.startIndex, item.endIndex));
+}

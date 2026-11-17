@@ -1,0 +1,51 @@
+# 이미지에 들어갈 것은 server/ 와 ai/apps 뿐이다 (infra/docker/server.Dockerfile).
+# 나머지를 빌드 컨텍스트에서 빼면 업로드가 빨라지고, 실수로 자격증명이 섞이지 않는다(SEC-2).
+
+.git
+.github
+.venv
+node_modules
+
+# 자격증명 — 절대 이미지에 넣지 않는다. 값은 k8s Secret 으로 주입한다.
+.env
+.env.*
+!.env.example
+
+# 사이트·문서·기획
+jekyll
+docs
+_project
+_site
+
+# 데이터·모델 — 용량이 크고 이미지가 쓰지 않는다
+data
+resources
+models
+golden-set
+knowledge-base
+
+# 이미지가 쓰지 않는 코드·자산
+apps
+db
+scripts
+infra
+
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.DS_Store
+
+# 테스트·검증 장치 — 런타임이 쓰지 않는다 (2026-09-15, `_project/decisions/114`).
+# `COPY server/` · `COPY ai/apps/` 가 넓어서 tests/ 하위 .py 86개(디렉터리 9개)가 운영 이미지에
+# 실리고 있었다. pytest 가 이미지에 없어 **동작 위험은 없었지만**, 머리말이 적은
+# 「이미지에 들어갈 것은 server/ 와 ai/apps 뿐」이라는 의도와 어긋났다.
+**/tests
+**/conftest.py
+**/pytest.ini
+**/.importlinter
+
+# 평가 하네스 — 배치로만 돈다(`scripts/run_eval.py`, E-1~E-4). 요청 경로에 들어오지 않는다.
+# ⚠ `ai/apps/call_guard`·`voice_signal` 은 빼지 않는다 — C-6·D-5 가 꽂힐 자리다.
+#   지금 배선이 없을 뿐이고(`/health` 의 spokes 는 넷), 빼면 나중에 꽂는 사람이
+#   **로컬에선 되는데 운영에서만 ImportError** 로 헤맨다.
+ai/apps/evaluation
